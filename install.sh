@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-REPO_RAW_URL="https://raw.githubusercontent.com/USERNAME_YAKO/REPO_YAKO/main"
+REPO_RAW_URL="https://raw.githubusercontent.com/Kabut27/cf-failover/main"
 INSTALL_DIR="/opt/cf-failover"
 CONFIG_DIR="/etc/cf-failover"
 CONFIG_FILE="${CONFIG_DIR}/config.env"
