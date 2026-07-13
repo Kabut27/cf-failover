@@ -42,7 +42,7 @@ Kwa mfano huu:
 ## Matumizi (one-click, kwenye kila server)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/Kabut27/cf-failover/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Kabut27/cf-failover/main/install.sh)"
 ```
 
 Itakuuliza:
