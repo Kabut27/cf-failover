@@ -34,7 +34,7 @@ Kwa mfano huu:
 2. Pakia faili hizi mbili: `install.sh` na `cf-failover.sh`
 3. Fungua `install.sh` na badilisha line hii juu:
    ```
-   REPO_RAW_URL="https://raw.githubusercontent.com/USERNAME_YAKO/REPO_YAKO/main"
+   REPO_RAW_URL="https://raw.githubusercontent.com/Kabut27/cf-failover/main"
    ```
    weka username na jina la repo yako halisi
 4. Commit na push
