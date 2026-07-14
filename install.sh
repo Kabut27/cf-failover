@@ -22,7 +22,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# Hakikisha zana muhimu zipo - baadhi ya VPS minimal hazina cron/curl kwa default
+# Hakikisha zana muhimu zipo - baadhi ya VPS minimal hazina cron/curl/jq kwa default
 for dep in curl flock; do
   if ! command -v "$dep" >/dev/null 2>&1; then
     echo "ERROR: '$dep' haipo kwenye mfumo huu. Sakinisha kwanza (mfano: apt-get install -y $dep)."
@@ -33,6 +33,10 @@ if ! command -v crontab >/dev/null 2>&1; then
   echo "cron haijasakinishwa - ninasakinisha sasa..."
   apt-get update -qq && apt-get install -y -qq cron
   systemctl enable --now cron >/dev/null 2>&1 || true
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq haijasakinishwa - ninasakinisha sasa (inahitajika kwa amri za Telegram)..."
+  apt-get update -qq && apt-get install -y -qq jq
 fi
 
 # Husomea input isiyo tupu - inarudia kuuliza mpaka mtumiaji ajaze
@@ -66,11 +70,20 @@ require_input "Cloudflare API Token (Zone.DNS Edit): " CF_API_TOKEN
 require_input "Cloudflare Zone ID: " CF_ZONE_ID
 echo ""
 echo "Weka node IP kwa mpangilio wa priority (ya kwanza ndio unayoitegemea zaidi)."
-echo "Zinaweza kuwa 2, 3, au zaidi."
+echo "Zinaweza kuwa 2, 3, au zaidi. (Hizi ni za MWANZO tu - baadaye zinaweza"
+echo "kubadilishwa kupitia amri za Telegram, na server ZOTE zitafuata mabadiliko"
+echo "hayo kiotomatiki.)"
 require_input "Node priority (comma separated, mfano 3.3.3.3,2.2.2.2,1.1.1.1): " NODE_PRIORITY
 echo ""
 echo "Weka domain records ambazo zitabadilishwa pamoja (1, 2, au zaidi)."
+echo "(Hizi pia zinaweza kubadilishwa baadaye kupitia Telegram.)"
 require_input "Target records (comma separated, mfano cdn1.domain.com,cdn2.domain.com): " TARGET_RECORDS
+echo ""
+echo "cf-failover inahifadhi NODE_PRIORITY na TARGET_RECORDS kwenye TXT record"
+echo "MOJA kwenye Cloudflare, ili server zako ZOTE zisome config ile ile."
+echo "Weka jina la TXT record hii (chagua jina lolote lisilotumika, mfano"
+echo "_cf-failover-config.domain.com) - LAZIMA liwe SAWA kwenye server zote."
+require_input "Config record name: " CONFIG_RECORD_NAME
 echo ""
 
 read -rp "Port ya kucheck [443]: " CHECK_PORT
@@ -112,7 +125,11 @@ if [[ "$CHECK_METHOD" == "http" ]]; then
 fi
 
 echo ""
-echo "Arifa za Telegram ni hiari. Acha wazi (Enter) kama hutaki."
+echo "Arifa za Telegram ni hiari, LAKINI zinahitajika kama unataka kutumia"
+echo "amri za /addip, /removeip, /addrecord n.k. Acha wazi (Enter) kama hutaki."
+echo "MUHIMU: tumia bot iliyotengwa kwa cf-failover peke yake (siyo bot"
+echo "inayotumika na huduma nyingine), na tumia Bot Token/Chat ID SAWA"
+echo "kwenye server zote unazosakinisha."
 read -rp "Telegram Bot Token (hiari): " TELEGRAM_BOT_TOKEN
 read -rp "Telegram Chat ID (hiari): " TELEGRAM_CHAT_ID
 while [[ -n "$TELEGRAM_CHAT_ID" ]] && ! [[ "$TELEGRAM_CHAT_ID" =~ ^-?[0-9]+$ ]]; do
@@ -159,6 +176,7 @@ CF_API_TOKEN="${CF_API_TOKEN}"
 CF_ZONE_ID="${CF_ZONE_ID}"
 NODE_PRIORITY="${NODE_PRIORITY}"
 TARGET_RECORDS="${TARGET_RECORDS}"
+CONFIG_RECORD_NAME="${CONFIG_RECORD_NAME}"
 CHECK_PORT="${CHECK_PORT}"
 FAIL_THRESHOLD="${FAIL_THRESHOLD}"
 CHECK_METHOD="${CHECK_METHOD}"
@@ -173,7 +191,7 @@ EOF
 
 chmod 600 "$CONFIG_FILE"
 
-# Cron - inakimbia kila dakika (failover check + ripoti ikiwa muda umefika)
+# Cron - inakimbia kila dakika (failover check + amri za Telegram + ripoti)
 CRON_LINE="* * * * * ${INSTALL_DIR}/cf-failover.sh >> /var/log/cf-failover.log 2>&1"
 ( crontab -l 2>/dev/null | grep -v "cf-failover.sh" ; echo "$CRON_LINE" ) | crontab -
 
@@ -199,5 +217,9 @@ echo "Config: $CONFIG_FILE"
 echo "Script: ${INSTALL_DIR}/cf-failover.sh"
 echo "Logs:   /var/log/cf-failover.log"
 echo ""
-echo "Kimbiza installer hii vivyo hivyo kwenye node zako zote (input sawa kila mahali)."
+echo "MUHIMU: Kimbiza installer hii kwenye node zako ZOTE ukitumia CF_API_TOKEN,"
+echo "CF_ZONE_ID, CONFIG_RECORD_NAME, TELEGRAM_BOT_TOKEN na TELEGRAM_CHAT_ID"
+echo "SAWA kila mahali (NODE_PRIORITY/TARGET_RECORDS unaweza kuweka chochote"
+echo "mara ya kwanza - baada ya server ya kwanza kutengeneza config record,"
+echo "zote zitafuata thamani hiyo hiyo kiotomatiki)."
 echo "Angalia logs kwa: tail -f /var/log/cf-failover.log"
