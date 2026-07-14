@@ -21,8 +21,6 @@ fi
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
-# Hakikisha fields muhimu zipo - kuzuia matatizo kimya kimya kama config
-# imehaririwa kwa mkono na sehemu muhimu ikafutwa kimakosa
 for var in CF_API_TOKEN CF_ZONE_ID NODE_PRIORITY TARGET_RECORDS; do
   if [[ -z "${!var:-}" ]]; then
     echo "ERROR: ${var} haipo au haina thamani kwenye ${CONFIG_FILE}. Rekebisha kisha jaribu tena."
@@ -30,7 +28,6 @@ for var in CF_API_TOKEN CF_ZONE_ID NODE_PRIORITY TARGET_RECORDS; do
   fi
 done
 
-# Onyesha wapi hasa script ilipovunjika, ikitokea (husaidia kwenye logs)
 trap 'echo "$(date "+%Y-%m-%d %H:%M:%S") - ERROR: script imesimama bila kutarajiwa kwenye line $LINENO" >&2' ERR
 
 ########################################
@@ -51,14 +48,14 @@ mkdir -p "$(dirname "$STATE_FILE")"
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-5}"
 FAIL_THRESHOLD="${FAIL_THRESHOLD:-2}"
 CHECK_PORT="${CHECK_PORT:-443}"
-CHECK_METHOD="${CHECK_METHOD:-tcp}"        # tcp au http
+CHECK_METHOD="${CHECK_METHOD:-tcp}"
 HEALTH_PATH="${HEALTH_PATH:-/}"
 CHECK_SCHEME="${CHECK_SCHEME:-https}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-10}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
-STATUS_REPORT_MINUTES="${STATUS_REPORT_MINUTES:-360}"   # 0 = zima ripoti za mara kwa mara
-DNS_TTL="${DNS_TTL:-60}"   # Cloudflare inahitaji kati ya 60-86400, au 1 kwa Automatic
+STATUS_REPORT_MINUTES="${STATUS_REPORT_MINUTES:-360}"
+DNS_TTL="${DNS_TTL:-60}"
 
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
@@ -70,7 +67,7 @@ log() {
 notify_telegram() {
   local message="$1"
   if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
-    return 0   # arifa hazijawekwa, ruka kimya
+    return 0
   fi
   curl -s --connect-timeout 5 --max-time "$CURL_TIMEOUT" -X POST \
     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -121,9 +118,8 @@ EOF
 }
 
 ########################################
-# CLOUDFLARE API (imeunganishwa - call moja badala ya mbili)
+# CLOUDFLARE API
 ########################################
-# Inarudisha "record_id|current_ip" kwa record moja
 get_record_info() {
   local record_name="$1"
   local response
@@ -134,8 +130,10 @@ get_record_info() {
 
   local rid
   local rip
-  rid=$(echo "$response" | grep -o '"id":"[^"]*' | head -1 | cut -d'"' -f4)
-  rip=$(echo "$response" | grep -o '"content":"[^"]*' | head -1 | cut -d'"' -f4)
+  # FIX: '|| true' - record isipokuwepo bado, grep haipati kitu (exit 1),
+  # bila hii, pipefail+set -e ingeua script kabla ya create_dns/upsert_dns.
+  rid=$(echo "$response" | grep -o '"id":"[^"]*' | head -1 | cut -d'"' -f4 || true)
+  rip=$(echo "$response" | grep -o '"content":"[^"]*' | head -1 | cut -d'"' -f4 || true)
   echo "${rid}|${rip}"
 }
 
@@ -165,7 +163,6 @@ upsert_dns() {
   local new_ip="$3"
 
   if [[ -z "$record_id" ]]; then
-    # Record haipo kabisa kwenye Cloudflare bado - itengeneze mpya
     create_dns "$record_name" "$new_ip"
     return $?
   fi
@@ -187,8 +184,7 @@ upsert_dns() {
 }
 
 ########################################
-# STATUS REPORT (mara kwa mara, ndani ya run hii hii ya dakika 1,
-# lakini inatuma tu ikiwa muda uliowekwa (STATUS_REPORT_MINUTES) umefika)
+# STATUS REPORT
 ########################################
 send_status_report() {
   local report="📊 *CF-Failover — Ripoti ya Hali*
@@ -212,7 +208,7 @@ send_status_report() {
 }
 
 ########################################
-# TELEGRAM COMMANDS (/refresh) - kuruhusu kuomba ripoti ya papo hapo
+# TELEGRAM COMMANDS (/refresh)
 ########################################
 REFRESH_REQUESTED=0
 poll_telegram_commands() {
@@ -224,14 +220,17 @@ poll_telegram_commands() {
   response=$(curl -s --connect-timeout 5 --max-time "$CURL_TIMEOUT" \
     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${offset}&limit=20&timeout=0" 2>/dev/null) || return 0
 
-  # Sonyesha offset mbele kila wakati ili kuepuka kusoma ujumbe uleule mara mbili
+  # FIX: '|| true' - hapa ndipo palikuwa na bug kuu. Karibu kila run (hakuna
+  # ujumbe mpya), grep haipati "update_id" (exit 1) -> pipefail+set -e
+  # zilikuwa zinaua script HAPA kila dakika, kabla ya health check/DNS.
+  # Ndiyo maana script "ilifanya kazi" tu ulipotuma /refresh (wakati huo
+  # kulikuwa na ujumbe, hivyo grep ilipata match na script iliendelea).
   local max_update_id
-  max_update_id=$(echo "$response" | grep -o '"update_id":[0-9]*' | grep -o '[0-9]*' | sort -n | tail -1)
+  max_update_id=$(echo "$response" | grep -o '"update_id":[0-9]*' | grep -o '[0-9]*' | sort -n | tail -1 || true)
   if [[ -n "$max_update_id" ]]; then
     TELEGRAM_OFFSET="$max_update_id"
   fi
 
-  # Kubali amri tu kama inatoka kwenye chat sahihi (chat ID uliyoweka)
   if echo "$response" | grep -q "\"chat\":{\"id\":${TELEGRAM_CHAT_ID}" && \
      echo "$response" | grep -qi '"text":"\/refresh"\|"text":"\/status"'; then
     REFRESH_REQUESTED=1
@@ -245,7 +244,6 @@ poll_telegram_commands() {
 load_state
 poll_telegram_commands
 
-# NODE_PRIORITY: list ya IP kwa mpangilio - inaweza kuwa 2, 3, au zaidi
 IFS=',' read -ra PRIORITY_ARR <<< "$NODE_PRIORITY"
 TOP_IP="${PRIORITY_ARR[0]}"
 
@@ -262,7 +260,6 @@ done
 TOP_IP_UP="${NODE_STATUS_ARR[0]}"
 NODE_STATUS_JOINED=$(IFS=,; echo "${NODE_STATUS_ARR[*]}")
 
-# Arifa za kila node ikibadilika hali (up<->down), siyo tu ile inayoathiri DNS
 if [[ -n "${PREV_NODE_STATUS:-}" ]]; then
   IFS=',' read -ra PREV_STATUS_ARR <<< "$PREV_NODE_STATUS"
   idx=0
@@ -317,7 +314,6 @@ else
   FAIL_COUNT=0
 fi
 
-# TARGET_RECORDS: domain 1, 2, 3 au zaidi - comma separated
 IFS=',' read -ra RECORDS_ARR <<< "$TARGET_RECORDS"
 for record in "${RECORDS_ARR[@]}"; do
   info=$(get_record_info "$record")
@@ -356,7 +352,6 @@ Kila kitu kinaendelea sawa 🎉"
   fi
 done
 
-# Ripoti ya mara kwa mara ya hali ya node zote, AU papo hapo kama /refresh imetumwa
 if [[ "$REFRESH_REQUESTED" -eq 1 ]]; then
   send_status_report
   NOW_EPOCH=$(date '+%s')
