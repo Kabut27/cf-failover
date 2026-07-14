@@ -1,13 +1,9 @@
 #!/bin/bash
 #
 # cf-failover.sh
-# Automatic health-check + Cloudflare DNS failover
+# Automatic health-check + Cloudflare DNS failover (Premium Edition)
 # Inasaidia: priority list ya nodes (2+), domain records kadhaa (1+),
-# lock file (kuzuia overlapping runs), arifa za Telegram, HTTP au TCP
-# health check, na curl timeouts kuzuia kunasa (hang).
-#
-# Weka script hii kwenye SERVER ZOTE (node zote) - kila moja inafanya kazi
-# kwa kujitegemea, ikiangalia hali halisi ya DNS kwenye Cloudflare kila run.
+# lock file, arifa za Telegram zenye Latency + Server Stats, na TCP/HTTP health check.
 
 set -euo pipefail
 
@@ -68,7 +64,7 @@ notify_telegram() {
 }
 
 ########################################
-# HEALTH CHECK
+# HEALTH CHECK & LATENCY CALCULATION
 ########################################
 check_node() {
   local ip="$1"
@@ -79,6 +75,29 @@ check_node() {
     [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]
   else
     timeout "$CHECK_TIMEOUT" bash -c "cat < /dev/null > /dev/tcp/${ip}/${CHECK_PORT}" 2>/dev/null
+  fi
+}
+
+get_latency() {
+  local ip="$1"
+  local t
+  if [[ "$CHECK_METHOD" == "http" ]]; then
+    t=$(curl -k -s -o /dev/null -w '%{time_total}' --max-time 2 "${CHECK_SCHEME}://${ip}:${CHECK_PORT}${HEALTH_PATH}" 2>/dev/null || echo "0")
+  else
+    t=$(curl -s -o /dev/null -w '%{time_connect}' --max-time 2 "telnet://${ip}:${CHECK_PORT}" 2>/dev/null || echo "0")
+  fi
+
+  if [[ "$t" == "0" || "$t" == "0.000000" || "$t" == "0.000" ]]; then
+    echo "Timeout"
+  elif [[ "$t" =~ ^0\.([0-9]{3}) ]]; then
+    local ms="${BASH_REMATCH[1]}"
+    echo "$((10#$ms))ms"
+  elif [[ "$t" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
+    local sec="${BASH_REMATCH[1]}"
+    local milli="${BASH_REMATCH[2]}"
+    echo "$((sec * 1000 + 10#$milli))ms"
+  else
+    echo "${t}s"
   fi
 }
 
@@ -111,7 +130,6 @@ EOF
 ########################################
 # CLOUDFLARE API
 ########################################
-# Inarudisha "record_id|current_ip" kwa record moja
 get_record_info() {
   local record_name="$1"
   local response
@@ -122,7 +140,6 @@ get_record_info() {
 
   local rid
   local rip
-  # Alama za [[:space:]]* zinalinda script dhidi ya mabadiliko ya spacing kwenye JSON ya Cloudflare
   rid=$(echo "$response" | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*' | head -1 | cut -d'"' -f4)
   rip=$(echo "$response" | grep -o '"content"[[:space:]]*:[[:space:]]*"[^"]*' | head -1 | cut -d'"' -f4)
   echo "${rid}|${rip}"
@@ -154,7 +171,6 @@ upsert_dns() {
   local new_ip="$3"
 
   if [[ -z "$record_id" ]]; then
-    # Record haipo kabisa kwenye Cloudflare bado - itengeneze mpya
     create_dns "$record_name" "$new_ip"
     return $?
   fi
@@ -176,31 +192,49 @@ upsert_dns() {
 }
 
 ########################################
-# STATUS REPORT
+# STATUS REPORT (PREMIUM INTERFACE)
 ########################################
 send_status_report() {
-  local report="📊 *CF-Failover — Ripoti ya Hali*
-━━━━━━━━━━━━━━━"
+  # Kusoma Resource za Server ya sasa
+  local cpu_load ram_info
+  cpu_load=$(cat /proc/loadavg 2>/dev/null | cut -d' ' -f1 || echo "N/A")
+  ram_info=$(free -m 2>/dev/null | awk '/Mem:/ {printf "%d / %d MB", $3, $2}' || echo "N/A")
+
+  local report="📊 *CF-FAILOVER — RIPOTI YA HALI*
+━━━━━━━━━━━━━━━━━━"
+  
   local idx=1
   for ip in "${PRIORITY_ARR[@]}"; do
     if [[ "${NODE_STATUS_ARR[$((idx-1))]}" == "1" ]]; then
+      local latency
+      latency=$(get_latency "$ip")
       report="${report}
-✅ Node ${idx} (\`${ip}\`) — Iko hai"
+✅ *Node ${idx}* (\`${ip}\`)
+├─ Hali: \`Iko Hai\`
+└─ Kasi: \`${latency}\`"
     else
       report="${report}
-❌ Node ${idx} (\`${ip}\`) — Haipatikani"
+❌ *Node ${idx}* (\`${ip}\`)
+└─ Hali: \`Haipatikani\`"
     fi
+    report="${report}
+"
     idx=$((idx + 1))
   done
-  report="${report}
-━━━━━━━━━━━━━━━
-🎯 Inayotumika sasa: \`${DESIRED_IP}\`
-🕒 $(date '+%H:%M:%S | %d-%m-%Y')"
+
+  report="${report}━━━━━━━━━━━━━━━━━━
+🎯 *Inayotumika:* \`${DESIRED_IP}\`
+
+🖥️ *Afya ya Server Hii:*
+├─ CPU Load: \`${cpu_load}\`
+└─ RAM Usage: \`${ram_info}\`
+
+🕒 *Muda:* $(date '+%H:%M:%S | %d-%m-%Y')"
   notify_telegram "$report"
 }
 
 ########################################
-# TELEGRAM COMMANDS (/refresh)
+# TELEGRAM COMMANDS (/refresh au /status)
 ########################################
 REFRESH_REQUESTED=0
 poll_telegram_commands() {
@@ -256,10 +290,13 @@ if [[ -n "${PREV_NODE_STATUS:-}" ]]; then
     if [[ "$old_status" != "$new_status" ]]; then
       TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
       if [[ "$new_status" == "1" ]]; then
-        notify_telegram "🟢 *Node $((idx+1))* (\`${ip}\`) imerudi hewani
+        local lat
+        lat=$(get_latency "$ip")
+        notify_telegram "🟢 *Node $((idx+1))* (\`${ip}\`) imerudi hewani!
+⚡ Kasi: \`${lat}\`
 🕒 ${TIMESTAMP}"
       else
-        notify_telegram "🔴 *Node $((idx+1))* (\`${ip}\`) imeshuka
+        notify_telegram "🔴 *Node $((idx+1))* (\`${ip}\`) imeshuka!
 🕒 ${TIMESTAMP}"
       fi
     fi
@@ -272,15 +309,13 @@ if [[ -z "$DESIRED_IP" ]]; then
   log "ONYO: Node ZOTE hazirespondi!"
   if [[ "${ALL_DOWN_NOTIFIED:-0}" -eq 0 ]]; then
     notify_telegram "🚨🚨 *DHARURA* 🚨🚨
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━
 Node ZOTE hazirespondi!
 📍 \`${NODE_PRIORITY}\`
 🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━
 ❌ Hakuna DNS iliyobadilishwa
-👉 Tafadhali angalia servers zako haraka
-
-_Arifa hii itatumwa tena tu ikiwa hali haitabadilika._"
+👉 Tafadhali angalia servers yako haraka"
     ALL_DOWN_NOTIFIED=1
   fi
   save_state
@@ -320,20 +355,20 @@ for record in "${RECORDS_ARR[@]}"; do
     TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
     if [[ "$DESIRED_IP" == "$TOP_IP" ]]; then
       notify_telegram "✅ *RESTORED* — Node kuu imerudi hewani!
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━
 🌐 Record: \`${record}\`
 🔙 Imerudi: \`${DESIRED_IP}\` (top priority)
 🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━
 Kila kitu kinaendelea sawa 🎉"
     else
       notify_telegram "🔁 *FAILOVER* — DNS imebadilishwa
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━
 🌐 Record: \`${record}\`
 📉 Kutoka: \`${current_ip:-haipo}\`
 📈 Kwenda: \`${DESIRED_IP}\`
 🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━
 ⚠️ Node ya awali haijibu - inafuatiliwa"
     fi
   fi
