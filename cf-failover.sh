@@ -58,7 +58,7 @@ CURL_TIMEOUT="${CURL_TIMEOUT:-10}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 STATUS_REPORT_MINUTES="${STATUS_REPORT_MINUTES:-360}"   # 0 = zima ripoti za mara kwa mara
-DNS_TTL="${DNS_TTL:-30}"
+DNS_TTL="${DNS_TTL:-60}"   # Cloudflare inahitaji kati ya 60-86400, au 1 kwa Automatic
 
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
