@@ -3,6 +3,15 @@
 # cf-failover.sh
 # Automatic health-check + Cloudflare DNS failover
 #
+# FIX (2026-07-15): Kabla, kama script ilisimama (crash) kwa sababu yoyote
+# KABLA ya kufika mwishoni, TELEGRAM_OFFSET na PREV_NODE_STATUS havikuwa
+# vinahifadhiwa - hivyo amri za Telegram (/addrecord, /addip n.k.) na
+# arifa za "node imerudi hewani" zilikuwa zikirudiwa kila run (kila
+# dakika) badala ya mara moja tu. Sasa TELEGRAM_OFFSET inahifadhiwa MARA
+# MOJA baada ya kusoma ujumbe (kabla ya sehemu yoyote inayoweza kukwama),
+# na kuna 'trap EXIT' inayohakikisha state inahifadhiwa hata script
+# ikitoka mapema kwa sababu ya error.
+#
 # Sasa inasaidia: kuedit NODE_PRIORITY na TARGET_RECORDS moja kwa moja
 # kupitia Telegram (/addip, /removeip, /setpriority, /addrecord,
 # /removerecord, /listips, /listrecords, /help). Config hii inahifadhiwa
@@ -14,7 +23,15 @@
 # kwa kujitegemea, ikiangalia hali halisi ya DNS/config kwenye Cloudflare
 # kila run.
 
-set -euo pipefail
+set -uo pipefail
+# NOTA: 'set -e' imeondolewa kimakusudi. Kwa script hii, amri nyingi za
+# mtandao (curl kwenda Cloudflare/Telegram) zinaweza kushindwa mara kwa
+# mara kwa sababu za muda (timeout, DNS blip). Kabla, 'set -e' ilisababisha
+# script kusimama ghafla mahali popote ikiwa amri moja tu ingeshindwa,
+# kabla ya kufika kwenye save_state() - matokeo yake state (TELEGRAM_OFFSET,
+# PREV_NODE_STATUS) haikuhifadhiwa na kila kitu kilijirudia run ijayo.
+# Sasa makosa yanashughulikiwa wazi (return codes / if-checks) kwenye kila
+# function muhimu badala ya kutegemea 'set -e'.
 
 CONFIG_FILE="/etc/cf-failover/config.env"
 
@@ -69,6 +86,14 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 STATUS_REPORT_MINUTES="${STATUS_REPORT_MINUTES:-360}"   # 0 = zima ripoti za mara kwa mara
 DNS_TTL="${DNS_TTL:-60}"   # Cloudflare inahitaji kati ya 60-86400, au 1 kwa Automatic
+
+# State ya awali (itabadilishwa na load_state)
+FAIL_COUNT=0
+ALL_DOWN_NOTIFIED=0
+LAST_REPORT_EPOCH=0
+TELEGRAM_OFFSET=0
+PREV_NODE_STATUS=""
+NODE_STATUS_JOINED=""
 
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
@@ -129,24 +154,42 @@ load_state() {
   if [[ -f "$STATE_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$STATE_FILE"
-  else
-    FAIL_COUNT=0
-    ALL_DOWN_NOTIFIED=0
-    LAST_REPORT_EPOCH=0
-    TELEGRAM_OFFSET=0
-    PREV_NODE_STATUS=""
   fi
 }
 
+# save_state ya JUMLA - inahifadhi kila kitu (fail count, offset, prev status)
 save_state() {
   cat > "$STATE_FILE" <<EOF
 FAIL_COUNT=$FAIL_COUNT
 ALL_DOWN_NOTIFIED=$ALL_DOWN_NOTIFIED
 LAST_REPORT_EPOCH=$LAST_REPORT_EPOCH
 TELEGRAM_OFFSET=${TELEGRAM_OFFSET:-0}
-PREV_NODE_STATUS="${NODE_STATUS_JOINED:-}"
+PREV_NODE_STATUS="${NODE_STATUS_JOINED:-${PREV_NODE_STATUS:-}}"
 EOF
 }
+
+# FIX: save_offset - inahifadhi TELEGRAM_OFFSET PEKEE, mara tu baada ya
+# kusoma ujumbe wa Telegram na KABLA ya sehemu yoyote ya DNS/Cloudflare
+# inayoweza kukwama. Hii inazuia amri (/addip, /addrecord n.k.) kusomwa
+# na kujibiwa tena na tena kama script itakwama baadaye kwenye run hiyo hiyo.
+save_offset() {
+  # Andika/badilisha state file bila kupoteza thamani nyingine zilizopo
+  local tmp_fail="${FAIL_COUNT:-0}"
+  local tmp_alldown="${ALL_DOWN_NOTIFIED:-0}"
+  local tmp_report="${LAST_REPORT_EPOCH:-0}"
+  local tmp_prev="${PREV_NODE_STATUS:-}"
+  cat > "$STATE_FILE" <<EOF
+FAIL_COUNT=$tmp_fail
+ALL_DOWN_NOTIFIED=$tmp_alldown
+LAST_REPORT_EPOCH=$tmp_report
+TELEGRAM_OFFSET=${TELEGRAM_OFFSET:-0}
+PREV_NODE_STATUS="${tmp_prev}"
+EOF
+}
+
+# FIX: hakikisha state (hasa TELEGRAM_OFFSET) inahifadhiwa hata script
+# ikitoka ghafla (error yoyote isiyotarajiwa) kabla ya kufika mwisho.
+trap 'save_state 2>/dev/null || true' EXIT
 
 ########################################
 # CLOUDFLARE API - DNS records za kawaida (A records za failover)
@@ -497,7 +540,14 @@ poll_telegram_commands() {
     chat_id=$(echo "$row" | jq -r '.message.chat.id // empty')
     text=$(echo "$row" | jq -r '.message.text // empty')
 
-    [[ -n "$uid" ]] && TELEGRAM_OFFSET="$uid"
+    # FIX: sasisha TELEGRAM_OFFSET na uihifadhi MARA MOJA kwa kila ujumbe
+    # unaosomwa (siyo mwishoni mwa script). Hivyo hata script ikikwama
+    # baadaye (mfano wakati wa kuwasiliana na Cloudflare), ujumbe huu
+    # hautasomwa tena run ijayo.
+    if [[ -n "$uid" ]]; then
+      TELEGRAM_OFFSET="$uid"
+      save_offset
+    fi
 
     [[ -z "$chat_id" || "$chat_id" != "$TELEGRAM_CHAT_ID" ]] && continue
     [[ -z "$text" ]] && continue
@@ -513,6 +563,7 @@ poll_telegram_commands() {
 load_state
 get_shared_config        # NODE_PRIORITY / TARGET_RECORDS kutoka Cloudflare (chanzo kimoja kwa server zote)
 poll_telegram_commands   # inaweza kubadilisha na kuhifadhi NODE_PRIORITY/TARGET_RECORDS papo hapo
+                         # (TELEGRAM_OFFSET tayari imehifadhiwa ndani ya function hii, mara moja kwa kila ujumbe)
 
 # NODE_PRIORITY: list ya IP kwa mpangilio - inaweza kuwa 2, 3, au zaidi
 IFS=',' read -ra PRIORITY_ARR <<< "$NODE_PRIORITY"
@@ -528,89 +579,4 @@ for ip in "${PRIORITY_ARR[@]}"; do
     NODE_STATUS_ARR+=("0")
   fi
 done
-TOP_IP_UP="${NODE_STATUS_ARR[0]}"
-NODE_STATUS_JOINED=$(IFS=,; echo "${NODE_STATUS_ARR[*]}")
-
-# Arifa za kila node ikibadilika hali (up<->down), siyo tu ile inayoathiri DNS
-if [[ -n "${PREV_NODE_STATUS:-}" ]]; then
-  IFS=',' read -ra PREV_STATUS_ARR <<< "$PREV_NODE_STATUS"
-  idx=0
-  for ip in "${PRIORITY_ARR[@]}"; do
-    old_status="${PREV_STATUS_ARR[$idx]:-1}"
-    new_status="${NODE_STATUS_ARR[$idx]}"
-    if [[ "$old_status" != "$new_status" ]]; then
-      TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
-      if [[ "$new_status" == "1" ]]; then
-        notify_telegram "🟢 *Node $((idx+1))* (\`${ip}\`) imerudi hewani
-🕒 ${TIMESTAMP}"
-      else
-        notify_telegram "🔴 *Node $((idx+1))* (\`${ip}\`) imeshuka
-🕒 ${TIMESTAMP}"
-      fi
-    fi
-    idx=$((idx+1))
-  done
-fi
-
-if [[ -z "$DESIRED_IP" ]]; then
-  TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
-  log "ONYO: Node ZOTE hazirespondi!"
-  if [[ "${ALL_DOWN_NOTIFIED:-0}" -eq 0 ]]; then
-    notify_telegram "🚨🚨 *DHARURA* 🚨🚨
-━━━━━━━━━━━━━━━
-Node ZOTE hazirespondi!
-📍 \`${NODE_PRIORITY}\`
-🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━
-❌ Hakuna DNS iliyobadilishwa
-👉 Tafadhali angalia servers zako haraka
-
-_Arifa hii itatumwa tena tu ikiwa hali haitabadilika._"
-    ALL_DOWN_NOTIFIED=1
-  fi
-  save_state
-  exit 0
-else
-  if [[ "${ALL_DOWN_NOTIFIED:-0}" -eq 1 ]]; then
-    notify_telegram "🟢 *NAFUU* — angalau node moja imerudi hewani (\`${DESIRED_IP}\`)"
-    ALL_DOWN_NOTIFIED=0
-  fi
-fi
-
-if [[ "$TOP_IP_UP" -eq 0 ]]; then
-  FAIL_COUNT=$((FAIL_COUNT + 1))
-  if [[ "$FAIL_COUNT" -eq 1 ]] || [[ "$FAIL_COUNT" -eq "$FAIL_THRESHOLD" ]]; then
-    log "TOP priority node ($TOP_IP) hairespondi. Fail count: $FAIL_COUNT/$FAIL_THRESHOLD"
-  fi
-else
-  FAIL_COUNT=0
-fi
-
-# TARGET_RECORDS: domain 1, 2, 3 au zaidi - comma separated
-IFS=',' read -ra RECORDS_ARR <<< "$TARGET_RECORDS"
-for record in "${RECORDS_ARR[@]}"; do
-  info=$(get_record_info "$record")
-  record_id="${info%%|*}"
-  current_ip="${info##*|}"
-
-  if [[ "$current_ip" == "$DESIRED_IP" ]]; then
-    continue
-  fi
-
-  if [[ "$current_ip" == "$TOP_IP" ]] && [[ "$FAIL_COUNT" -lt "$FAIL_THRESHOLD" ]]; then
-    continue
-  fi
-
-  log "${record}: ${current_ip:-haipo} -> ${DESIRED_IP}"
-  if upsert_dns "$record" "$record_id" "$DESIRED_IP"; then
-    TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
-    if [[ "$DESIRED_IP" == "$TOP_IP" ]]; then
-      notify_telegram "✅ *RESTORED* — Node kuu imerudi hewani!
-━━━━━━━━━━━━━━━
-🌐 Record: \`${record}\`
-🔙 Imerudi: \`${DESIRED_IP}\` (top priority)
-🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━
-Kila kitu kinaendelea sawa 🎉"
-    else
-      notify_telegram "🔁 *FAILOVER* — DNS imebadilish
+TOP_IP_UP="${NODE_STATUS_AR
