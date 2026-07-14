@@ -1,9 +1,13 @@
 #!/bin/bash
 #
 # cf-failover.sh
-# Automatic health-check + Cloudflare DNS failover (Premium Edition)
+# Automatic health-check + Cloudflare DNS failover
 # Inasaidia: priority list ya nodes (2+), domain records kadhaa (1+),
-# lock file, arifa za Telegram zenye Latency + Server Stats, na TCP/HTTP health check.
+# lock file (kuzuia overlapping runs), arifa za Telegram, HTTP au TCP
+# health check, na curl timeouts kuzuia kunasa (hang).
+#
+# Weka script hii kwenye SERVER ZOTE (node zote) - kila moja inafanya kazi
+# kwa kujitegemea, ikiangalia hali halisi ya DNS kwenye Cloudflare kila run.
 
 set -euo pipefail
 
@@ -16,6 +20,18 @@ fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+
+# Hakikisha fields muhimu zipo - kuzuia matatizo kimya kimya kama config
+# imehaririwa kwa mkono na sehemu muhimu ikafutwa kimakosa
+for var in CF_API_TOKEN CF_ZONE_ID NODE_PRIORITY TARGET_RECORDS; do
+  if [[ -z "${!var:-}" ]]; then
+    echo "ERROR: ${var} haipo au haina thamani kwenye ${CONFIG_FILE}. Rekebisha kisha jaribu tena."
+    exit 1
+  fi
+done
+
+# Onyesha wapi hasa script ilipovunjika, ikitokea (husaidia kwenye logs)
+trap 'echo "$(date "+%Y-%m-%d %H:%M:%S") - ERROR: script imesimama bila kutarajiwa kwenye line $LINENO" >&2' ERR
 
 ########################################
 # LOCK - kuzuia run mbili kwa wakati mmoja
@@ -59,12 +75,12 @@ notify_telegram() {
   curl -s --connect-timeout 5 --max-time "$CURL_TIMEOUT" -X POST \
     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     -d "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=${message}" \
+    -d "text=${message}" \
     -d "parse_mode=Markdown" >/dev/null 2>&1 || log "ONYO: Kutuma Telegram alert kumeshindikana"
 }
 
 ########################################
-# HEALTH CHECK & LATENCY CALCULATION
+# HEALTH CHECK
 ########################################
 check_node() {
   local ip="$1"
@@ -75,29 +91,6 @@ check_node() {
     [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]
   else
     timeout "$CHECK_TIMEOUT" bash -c "cat < /dev/null > /dev/tcp/${ip}/${CHECK_PORT}" 2>/dev/null
-  fi
-}
-
-get_latency() {
-  local ip="$1"
-  local t
-  if [[ "$CHECK_METHOD" == "http" ]]; then
-    t=$(curl -k -s -o /dev/null -w '%{time_total}' --max-time 2 "${CHECK_SCHEME}://${ip}:${CHECK_PORT}${HEALTH_PATH}" 2>/dev/null || echo "0")
-  else
-    t=$(curl -s -o /dev/null -w '%{time_connect}' --max-time 2 "telnet://${ip}:${CHECK_PORT}" 2>/dev/null || echo "0")
-  fi
-
-  if [[ "$t" == "0" || "$t" == "0.000000" || "$t" == "0.000" ]]; then
-    echo "Timeout"
-  elif [[ "$t" =~ ^0\.([0-9]{3}) ]]; then
-    local ms="${BASH_REMATCH[1]}"
-    echo "$((10#$ms))ms"
-  elif [[ "$t" =~ ^([0-9]+)\.([0-9]{3}) ]]; then
-    local sec="${BASH_REMATCH[1]}"
-    local milli="${BASH_REMATCH[2]}"
-    echo "$((sec * 1000 + 10#$milli))ms"
-  else
-    echo "${t}s"
   fi
 }
 
@@ -123,13 +116,14 @@ FAIL_COUNT=$FAIL_COUNT
 ALL_DOWN_NOTIFIED=$ALL_DOWN_NOTIFIED
 LAST_REPORT_EPOCH=$LAST_REPORT_EPOCH
 TELEGRAM_OFFSET=${TELEGRAM_OFFSET:-0}
-PREV_NODE_STATUS="${NODE_STATUS_JOINED:-${PREV_NODE_STATUS:-}}"
+PREV_NODE_STATUS="${NODE_STATUS_JOINED:-}"
 EOF
 }
 
 ########################################
-# CLOUDFLARE API
+# CLOUDFLARE API (imeunganishwa - call moja badala ya mbili)
 ########################################
+# Inarudisha "record_id|current_ip" kwa record moja
 get_record_info() {
   local record_name="$1"
   local response
@@ -140,8 +134,8 @@ get_record_info() {
 
   local rid
   local rip
-  rid=$(echo "$response" | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*' | head -1 | cut -d'"' -f4)
-  rip=$(echo "$response" | grep -o '"content"[[:space:]]*:[[:space:]]*"[^"]*' | head -1 | cut -d'"' -f4)
+  rid=$(echo "$response" | grep -o '"id":"[^"]*' | head -1 | cut -d'"' -f4)
+  rip=$(echo "$response" | grep -o '"content":"[^"]*' | head -1 | cut -d'"' -f4)
   echo "${rid}|${rip}"
 }
 
@@ -171,6 +165,7 @@ upsert_dns() {
   local new_ip="$3"
 
   if [[ -z "$record_id" ]]; then
+    # Record haipo kabisa kwenye Cloudflare bado - itengeneze mpya
     create_dns "$record_name" "$new_ip"
     return $?
   fi
@@ -192,49 +187,32 @@ upsert_dns() {
 }
 
 ########################################
-# STATUS REPORT (PREMIUM INTERFACE)
+# STATUS REPORT (mara kwa mara, ndani ya run hii hii ya dakika 1,
+# lakini inatuma tu ikiwa muda uliowekwa (STATUS_REPORT_MINUTES) umefika)
 ########################################
 send_status_report() {
-  # Kusoma Resource za Server ya sasa
-  local cpu_load ram_info
-  cpu_load=$(cat /proc/loadavg 2>/dev/null | cut -d' ' -f1 || echo "N/A")
-  ram_info=$(free -m 2>/dev/null | awk '/Mem:/ {printf "%d / %d MB", $3, $2}' || echo "N/A")
-
-  local report="📊 *CF-FAILOVER — RIPOTI YA HALI*
-━━━━━━━━━━━━━━━━━━"
-  
+  local report="📊 *CF-Failover — Ripoti ya Hali*
+━━━━━━━━━━━━━━━"
   local idx=1
   for ip in "${PRIORITY_ARR[@]}"; do
     if [[ "${NODE_STATUS_ARR[$((idx-1))]}" == "1" ]]; then
-      local latency
-      latency=$(get_latency "$ip")
       report="${report}
-✅ *Node ${idx}* (\`${ip}\`)
-├─ Hali: \`Iko Hai\`
-└─ Kasi: \`${latency}\`"
+✅ Node ${idx} (\`${ip}\`) — Iko hai"
     else
       report="${report}
-❌ *Node ${idx}* (\`${ip}\`)
-└─ Hali: \`Haipatikani\`"
+❌ Node ${idx} (\`${ip}\`) — Haipatikani"
     fi
-    report="${report}
-"
     idx=$((idx + 1))
   done
-
-  report="${report}━━━━━━━━━━━━━━━━━━
-🎯 *Inayotumika:* \`${DESIRED_IP}\`
-
-🖥️ *Afya ya Server Hii:*
-├─ CPU Load: \`${cpu_load}\`
-└─ RAM Usage: \`${ram_info}\`
-
-🕒 *Muda:* $(date '+%H:%M:%S | %d-%m-%Y')"
+  report="${report}
+━━━━━━━━━━━━━━━
+🎯 Inayotumika sasa: \`${DESIRED_IP}\`
+🕒 $(date '+%H:%M:%S | %d-%m-%Y')"
   notify_telegram "$report"
 }
 
 ########################################
-# TELEGRAM COMMANDS (/refresh au /status)
+# TELEGRAM COMMANDS (/refresh) - kuruhusu kuomba ripoti ya papo hapo
 ########################################
 REFRESH_REQUESTED=0
 poll_telegram_commands() {
@@ -246,12 +224,14 @@ poll_telegram_commands() {
   response=$(curl -s --connect-timeout 5 --max-time "$CURL_TIMEOUT" \
     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${offset}&limit=20&timeout=0" 2>/dev/null) || return 0
 
+  # Sonyesha offset mbele kila wakati ili kuepuka kusoma ujumbe uleule mara mbili
   local max_update_id
-  max_update_id=$( { echo "$response" | grep -o '"update_id":[0-9]*' | grep -o '[0-9]*' | sort -n | tail -1; } || true)
+  max_update_id=$(echo "$response" | grep -o '"update_id":[0-9]*' | grep -o '[0-9]*' | sort -n | tail -1)
   if [[ -n "$max_update_id" ]]; then
     TELEGRAM_OFFSET="$max_update_id"
   fi
 
+  # Kubali amri tu kama inatoka kwenye chat sahihi (chat ID uliyoweka)
   if echo "$response" | grep -q "\"chat\":{\"id\":${TELEGRAM_CHAT_ID}" && \
      echo "$response" | grep -qi '"text":"\/refresh"\|"text":"\/status"'; then
     REFRESH_REQUESTED=1
@@ -265,6 +245,7 @@ poll_telegram_commands() {
 load_state
 poll_telegram_commands
 
+# NODE_PRIORITY: list ya IP kwa mpangilio - inaweza kuwa 2, 3, au zaidi
 IFS=',' read -ra PRIORITY_ARR <<< "$NODE_PRIORITY"
 TOP_IP="${PRIORITY_ARR[0]}"
 
@@ -281,6 +262,7 @@ done
 TOP_IP_UP="${NODE_STATUS_ARR[0]}"
 NODE_STATUS_JOINED=$(IFS=,; echo "${NODE_STATUS_ARR[*]}")
 
+# Arifa za kila node ikibadilika hali (up<->down), siyo tu ile inayoathiri DNS
 if [[ -n "${PREV_NODE_STATUS:-}" ]]; then
   IFS=',' read -ra PREV_STATUS_ARR <<< "$PREV_NODE_STATUS"
   idx=0
@@ -290,13 +272,10 @@ if [[ -n "${PREV_NODE_STATUS:-}" ]]; then
     if [[ "$old_status" != "$new_status" ]]; then
       TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
       if [[ "$new_status" == "1" ]]; then
-        local lat
-        lat=$(get_latency "$ip")
-        notify_telegram "🟢 *Node $((idx+1))* (\`${ip}\`) imerudi hewani!
-⚡ Kasi: \`${lat}\`
+        notify_telegram "🟢 *Node $((idx+1))* (\`${ip}\`) imerudi hewani
 🕒 ${TIMESTAMP}"
       else
-        notify_telegram "🔴 *Node $((idx+1))* (\`${ip}\`) imeshuka!
+        notify_telegram "🔴 *Node $((idx+1))* (\`${ip}\`) imeshuka
 🕒 ${TIMESTAMP}"
       fi
     fi
@@ -309,13 +288,15 @@ if [[ -z "$DESIRED_IP" ]]; then
   log "ONYO: Node ZOTE hazirespondi!"
   if [[ "${ALL_DOWN_NOTIFIED:-0}" -eq 0 ]]; then
     notify_telegram "🚨🚨 *DHARURA* 🚨🚨
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 Node ZOTE hazirespondi!
 📍 \`${NODE_PRIORITY}\`
 🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 ❌ Hakuna DNS iliyobadilishwa
-👉 Tafadhali angalia servers yako haraka"
+👉 Tafadhali angalia servers zako haraka
+
+_Arifa hii itatumwa tena tu ikiwa hali haitabadilika._"
     ALL_DOWN_NOTIFIED=1
   fi
   save_state
@@ -336,6 +317,7 @@ else
   FAIL_COUNT=0
 fi
 
+# TARGET_RECORDS: domain 1, 2, 3 au zaidi - comma separated
 IFS=',' read -ra RECORDS_ARR <<< "$TARGET_RECORDS"
 for record in "${RECORDS_ARR[@]}"; do
   info=$(get_record_info "$record")
@@ -355,25 +337,26 @@ for record in "${RECORDS_ARR[@]}"; do
     TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
     if [[ "$DESIRED_IP" == "$TOP_IP" ]]; then
       notify_telegram "✅ *RESTORED* — Node kuu imerudi hewani!
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 🌐 Record: \`${record}\`
 🔙 Imerudi: \`${DESIRED_IP}\` (top priority)
 🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 Kila kitu kinaendelea sawa 🎉"
     else
       notify_telegram "🔁 *FAILOVER* — DNS imebadilishwa
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 🌐 Record: \`${record}\`
 📉 Kutoka: \`${current_ip:-haipo}\`
 📈 Kwenda: \`${DESIRED_IP}\`
 🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━
 ⚠️ Node ya awali haijibu - inafuatiliwa"
     fi
   fi
 done
 
+# Ripoti ya mara kwa mara ya hali ya node zote, AU papo hapo kama /refresh imetumwa
 if [[ "$REFRESH_REQUESTED" -eq 1 ]]; then
   send_status_report
   NOW_EPOCH=$(date '+%s')
