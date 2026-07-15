@@ -219,10 +219,24 @@ poll_once() {
     # ikiwa server nyingine tayari imebadilisha kitu.
     get_shared_config
 
-    if [[ -n "${PENDING_ACTION:-}" ]]; then
+    if handle_menu_button "$text"; then
+      # Kitufe kimetambulika na kimeshafanya kazi yake. Kama kulikuwa
+      # na PENDING_ACTION ya zamani iliyokwama (mfano amri ya awali
+      # haikukamilika), isitishe hapa - usiiruhusu imeze amri ijayo.
+      if [[ -n "${PENDING_ACTION:-}" ]]; then
+        PENDING_ACTION=""
+        save_telegram_state
+      fi
+    elif [[ "$text" == /* ]]; then
+      # Amri ya wazi (inayoanza na "/") pia ina kipaumbele juu ya
+      # subira yoyote ya zamani, kwa sababu hiyo hiyo.
+      handle_telegram_command "$text"
+      if [[ -n "${PENDING_ACTION:-}" ]]; then
+        PENDING_ACTION=""
+        save_telegram_state
+      fi
+    elif [[ -n "${PENDING_ACTION:-}" ]]; then
       handle_pending_reply "$PENDING_ACTION" "$text"
-    elif handle_menu_button "$text"; then
-      :
     else
       handle_telegram_command "$text"
     fi
