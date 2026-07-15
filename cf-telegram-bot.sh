@@ -226,12 +226,16 @@ poll_once() {
     get_shared_config
     log "DEBUG: get_shared_config imekamilika. NODE_PRIORITY='${NODE_PRIORITY}' TARGET_RECORDS='${TARGET_RECORDS}'"
 
+    local pending_before="${PENDING_ACTION:-}"
     if handle_menu_button "$text"; then
       log "DEBUG: '${text}' imeshughulikiwa kama kitufe cha menu."
-      # Kitufe kimetambulika na kimeshafanya kazi yake. Kama kulikuwa
-      # na PENDING_ACTION ya zamani iliyokwama (mfano amri ya awali
-      # haikukamilika), isitishe hapa - usiiruhusu imeze amri ijayo.
-      if [[ -n "${PENDING_ACTION:-}" ]]; then
+      # Futa PENDING_ACTION TU kama ilikuwa tayari imewekwa KABLA ya
+      # kitufe hiki na HAIKUBADILIKA (yaani ni subira ya ZAMANI
+      # iliyokwama). Kama kitufe hiki chenyewe kimeweka PENDING_ACTION
+      # mpya (mfano "Ongeza Domain" inasubiri domain), thamani itakuwa
+      # imebadilika - USIIGUSE, vinginevyo bot inasahau inachosubiri
+      # muda ule ule inapouliza.
+      if [[ -n "$pending_before" && "${PENDING_ACTION:-}" == "$pending_before" ]]; then
         PENDING_ACTION=""
         save_telegram_state
       fi
@@ -240,7 +244,7 @@ poll_once() {
       # Amri ya wazi (inayoanza na "/") pia ina kipaumbele juu ya
       # subira yoyote ya zamani, kwa sababu hiyo hiyo.
       handle_telegram_command "$text"
-      if [[ -n "${PENDING_ACTION:-}" ]]; then
+      if [[ -n "$pending_before" && "${PENDING_ACTION:-}" == "$pending_before" ]]; then
         PENDING_ACTION=""
         save_telegram_state
       fi
