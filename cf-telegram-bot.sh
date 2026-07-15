@@ -219,16 +219,12 @@ poll_once() {
     [[ -z "$chat_id" || "$chat_id" != "$TELEGRAM_CHAT_ID" ]] && continue
     [[ -z "$text" ]] && continue
 
-    log "DEBUG: Ujumbe umepokelewa: uid=${uid} text='${text}' PENDING_ACTION='${PENDING_ACTION:-}'"
-
     # Data ya NODE_PRIORITY/TARGET_RECORDS ibaki mpya kabla ya kila amri,
     # ikiwa server nyingine tayari imebadilisha kitu.
     get_shared_config
-    log "DEBUG: get_shared_config imekamilika. NODE_PRIORITY='${NODE_PRIORITY}' TARGET_RECORDS='${TARGET_RECORDS}'"
 
     local pending_before="${PENDING_ACTION:-}"
     if handle_menu_button "$text"; then
-      log "DEBUG: '${text}' imeshughulikiwa kama kitufe cha menu."
       # Futa PENDING_ACTION TU kama ilikuwa tayari imewekwa KABLA ya
       # kitufe hiki na HAIKUBADILIKA (yaani ni subira ya ZAMANI
       # iliyokwama). Kama kitufe hiki chenyewe kimeweka PENDING_ACTION
@@ -240,7 +236,6 @@ poll_once() {
         save_telegram_state
       fi
     elif [[ "$text" == /* ]]; then
-      log "DEBUG: '${text}' imeshughulikiwa kama amri ya /slash."
       # Amri ya wazi (inayoanza na "/") pia ina kipaumbele juu ya
       # subira yoyote ya zamani, kwa sababu hiyo hiyo.
       handle_telegram_command "$text"
@@ -249,14 +244,10 @@ poll_once() {
         save_telegram_state
       fi
     elif [[ -n "${PENDING_ACTION:-}" ]]; then
-      log "DEBUG: '${text}' imepelekwa handle_pending_reply kama jibu la '${PENDING_ACTION}'."
       handle_pending_reply "$PENDING_ACTION" "$text"
-      log "DEBUG: handle_pending_reply imekamilika."
     else
-      log "DEBUG: '${text}' haikutambulika popote - handle_telegram_command (fallback)."
       handle_telegram_command "$text"
     fi
-    log "DEBUG: Usindikaji wa uid=${uid} umekamilika."
   done < <(echo "$response" | jq -c '.result[]' 2>/dev/null || true)
 
   return 0
