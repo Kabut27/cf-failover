@@ -28,11 +28,27 @@ notify_telegram() {
   if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
     return 0   # arifa hazijawekwa, ruka kimya
   fi
-  curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
+  local response
+  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    -d "chat_id=${TELEGRAM_CHAT_ID}" \
-    -d "text=${message}" \
-    -d "parse_mode=Markdown" >/dev/null 2>&1 || log "ONYO: Kutuma Telegram alert kumeshindikana"
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${message}" \
+    --data-urlencode "parse_mode=Markdown" 2>/dev/null)
+
+  if ! echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+    # Ujumbe una alama za Markdown zisizolingana (_, *, `) - Telegram
+    # inakataa kutuma kimya kimya. Jaribu tena BILA parse_mode ili
+    # ujumbe ufike kwa hali yoyote, badala ya kupotea kabisa.
+    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
+      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=${message}" 2>/dev/null)
+    if ! echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+      log "ONYO: Kutuma Telegram alert kumeshindikana kabisa. Response: $response"
+      return 1
+    fi
+  fi
+  return 0
 }
 
 # Muundo wa keyboard - vitufe vinavyoonekana chini ya uwanja wa kuandika
@@ -43,13 +59,26 @@ notify_telegram_kb() {
   if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
     return 0
   fi
-  curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
+  local response
+  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    -d "chat_id=${TELEGRAM_CHAT_ID}" \
-    -d "text=${message}" \
-    -d "parse_mode=Markdown" \
-    --data-urlencode "reply_markup=${MAIN_KEYBOARD_JSON}" >/dev/null 2>&1 \
-    || log "ONYO: Kutuma Telegram alert (na keyboard) kumeshindikana"
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${message}" \
+    --data-urlencode "parse_mode=Markdown" \
+    --data-urlencode "reply_markup=${MAIN_KEYBOARD_JSON}" 2>/dev/null)
+
+  if ! echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
+      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=${message}" \
+      --data-urlencode "reply_markup=${MAIN_KEYBOARD_JSON}" 2>/dev/null)
+    if ! echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+      log "ONYO: Kutuma Telegram alert (na keyboard) kumeshindikana kabisa. Response: $response"
+      return 1
+    fi
+  fi
+  return 0
 }
 
 ########################################
@@ -442,7 +471,7 @@ ${idx}. \`${ip}\`"
 }
 
 handle_addrecord() {
-  local d="$1"
+  local d="${1,,}"
   if ! is_valid_domain "$d"; then
     notify_telegram "❌ Domain si sahihi: \`${d}\`"
     return
@@ -463,7 +492,7 @@ handle_addrecord() {
 }
 
 handle_removerecord() {
-  local d="$1"
+  local d="${1,,}"
   IFS=',' read -ra arr <<< "$TARGET_RECORDS"
   local newarr=() found=0 existing
   for existing in "${arr[@]}"; do
