@@ -60,6 +60,12 @@ HEALTH_PATH="${HEALTH_PATH:-/}"
 CHECK_SCHEME="${CHECK_SCHEME:-https}"
 DNS_TTL="${DNS_TTL:-60}"
 
+# Jina la TXT record ya "uongozi" wa Telegram - linatokana na
+# CONFIG_RECORD_NAME ile ile uliyoweka wakati wa install.sh, hivyo
+# halihitaji swali jipya kwa mtumiaji.
+TG_LEADER_RECORD_NAME="tgleader.${CONFIG_RECORD_NAME}"
+ensure_node_id
+
 ########################################
 # LOCK - inazuia instance mbili za huduma hii kwenye node HII HII
 # (mfano ukikimbiza script kwa mkono wakati systemd tayari inaiendesha)
@@ -226,16 +232,47 @@ poll_once() {
 }
 
 ########################################
-# MAIN LOOP
+# MAIN LOOP - na "leader election"
+#
+# Node ZOTE zinaendesha huduma hii (kama ilivyoelezwa juu), lakini
+# NODE MOJA TU ndiyo inayozungumza na Telegram (getUpdates) kwa wakati
+# mmoja - Telegram haikubali watumaji wawili wa token moja kwa wakati
+# mmoja (hutoa 409 Conflict na kusababisha majibu ya mara mbili/tatu au
+# amri kukwama). Node zisizo kiongozi zinasubiri kimya, zikiangalia kila
+# baada ya sekunde chache kama kiongozi bado "yuko hai" (heartbeat).
+# Kiongozi akizima kwa sababu yoyote, node nyingine INACHUKUA NAFASI
+# kiotomatiki ndani ya CF_TG_LEADER_TTL sekunde - hakuna hatua ya mkono.
 ########################################
-log "cf-telegram-bot.sh imeanza (long-polling)."
+log "cf-telegram-bot.sh imeanza. Node ID: ${NODE_ID}"
 load_telegram_state
 get_shared_config
 
 while true; do
-  if ! poll_once; then
-    # Tatizo la mtandao/Telegram - subiri kidogo kabla ya kujaribu tena
-    # ili kuepusha kuuliza mfululizo bila mwisho (busy loop) wakati wa tatizo.
-    sleep 3
+  if am_i_leader; then
+    log "Ninaendesha huduma ya Telegram kama KIONGOZI (${NODE_ID})."
+    last_heartbeat_ts=$(date +%s)
+    while true; do
+      if ! poll_once; then
+        sleep 3
+      fi
+      now=$(date +%s)
+      if (( now - last_heartbeat_ts >= CF_TG_HEARTBEAT_INTERVAL )); then
+        if ! claim_leadership; then
+          log "ONYO: Kusasisha heartbeat kumeshindikana - nitajaribu tena hivi karibuni."
+        fi
+        last_heartbeat_ts=$now
+      fi
+      # Endapo node nyingine imedai uongozi (nadra sana, lakini
+      # inawezekana kama mtandao ulikatika kwa muda mrefu), acha
+      # kuzungumza na Telegram mara moja ili kuepusha mgongano.
+      if [[ "$LEADER_NODE_ID" != "$NODE_ID" ]]; then
+        log "Node nyingine (${LEADER_NODE_ID}) imekuwa kiongozi - ninasubiri."
+        break
+      fi
+    done
+  else
+    # Siyo kiongozi kwa sasa - subiri kimya (bila kuzungumza na Telegram)
+    # kisha angalia tena kama kiongozi wa sasa bado yuko hai.
+    sleep 5
   fi
 done
