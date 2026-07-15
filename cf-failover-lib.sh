@@ -345,6 +345,11 @@ get_shared_config() {
     -H "Authorization: Bearer ${CF_API_TOKEN}" \
     -H "Content-Type: application/json")
 
+  if [[ -z "$response" ]]; then
+    log "ERROR: get_shared_config - Cloudflare haikurudisha jibu lolote (mtandao/timeout?). NODE_PRIORITY/TARGET_RECORDS ya sasa itaendelea kutumika."
+    return 1
+  fi
+
   rid=$(echo "$response" | jq -r '.result[0].id // empty')
   content=$(echo "$response" | jq -r '.result[0].content // empty')
   SHARED_CONFIG_RECORD_ID="$rid"
