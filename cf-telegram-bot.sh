@@ -203,6 +203,10 @@ poll_once() {
     uid=$(echo "$row" | jq -r '.update_id // empty')
     chat_id=$(echo "$row" | jq -r '.message.chat.id // empty')
     text=$(echo "$row" | jq -r '.message.text // empty')
+    # Ondoa nafasi za ziada mwanzo/mwisho (mfano kutoka copy-paste au
+    # autocorrect ya simu) - bila hii, "5.rayoo.uk " (na nafasi
+    # mwishoni) ingeonekana "si sahihi" hata ikiwa domain ni sahihi.
+    text="$(echo "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 
     # Sasisha na uhifadhi offset MARA MOJA kwa kila ujumbe unaosomwa,
     # kabla ya kushughulikia (ili ujumbe usisomwe tena run/loop ijayo
