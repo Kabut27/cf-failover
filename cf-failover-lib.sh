@@ -204,6 +204,106 @@ upsert_dns() {
 }
 
 ########################################
+# TELEGRAM LEADER ELECTION - inaruhusu server ZOTE kuendesha
+# cf-telegram-bot.sh (usanifu ule ule wa "hakuna server kuu"), lakini
+# NODE MOJA TU ndiyo inayozungumza na Telegram kwa wakati mmoja
+# (Telegram haikubali watumaji wawili wa getUpdates kwa token moja).
+#
+# Jinsi inavyofanya kazi: TXT record MOJA kwenye Cloudflare inashikilia
+# "NODE_ID=<id>;TS=<epoch>" ya node inayoongoza sasa (heartbeat). Kila
+# node isiyo kiongozi inaangalia record hii mara kwa mara; kiongozi
+# akikaa kimya zaidi ya CF_TG_LEADER_TTL sekunde (amezima/amekufa),
+# node ya kwanza kugundua inajitangaza kiongozi papo hapo - hakuna
+# mtu wa kubofya chochote, inatokea kiotomatiki.
+########################################
+CF_TG_LEADER_TTL="${CF_TG_LEADER_TTL:-45}"      # sekunde - kiongozi akikaa kimya zaidi ya hii, anahesabiwa amekufa
+CF_TG_HEARTBEAT_INTERVAL="${CF_TG_HEARTBEAT_INTERVAL:-15}"  # kila sekunde ngapi kiongozi anasasisha heartbeat yake
+TG_LEADER_RECORD_ID=""
+LEADER_NODE_ID=""
+LEADER_TS=0
+
+# Kitambulisho cha kudumu cha node hii - kinabaki kile kile hata baada
+# ya reboot/restart, ili "uongozi" usibadilike bila sababu.
+ensure_node_id() {
+  local id_file="/etc/cf-failover/node-id"
+  if [[ -f "$id_file" ]]; then
+    NODE_ID="$(cat "$id_file")"
+  else
+    NODE_ID="$(hostname 2>/dev/null || echo node)-$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c6)"
+    mkdir -p "$(dirname "$id_file")"
+    echo "$NODE_ID" > "$id_file"
+  fi
+}
+
+get_leader_info() {
+  local response rid content
+  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X GET \
+    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=TXT&name=${TG_LEADER_RECORD_NAME}" \
+    -H "Authorization: Bearer ${CF_API_TOKEN}" \
+    -H "Content-Type: application/json")
+
+  rid=$(echo "$response" | jq -r '.result[0].id // empty')
+  content=$(echo "$response" | jq -r '.result[0].content // empty')
+  TG_LEADER_RECORD_ID="$rid"
+  LEADER_NODE_ID=$(echo "$content" | grep -o 'NODE_ID=[^;]*' | cut -d= -f2- || true)
+  LEADER_TS=$(echo "$content" | grep -o 'TS=[0-9]*' | cut -d= -f2- || echo 0)
+  [[ -z "$LEADER_TS" ]] && LEADER_TS=0
+}
+
+# Node hii inajitangaza (au inathibitisha) kuwa kiongozi sasa hivi.
+claim_leadership() {
+  local now content payload response
+  now=$(date +%s)
+  content="NODE_ID=${NODE_ID};TS=${now}"
+  payload=$(jq -n --arg name "$TG_LEADER_RECORD_NAME" --arg content "$content" \
+    '{type:"TXT",name:$name,content:$content,ttl:60}')
+
+  if [[ -z "$TG_LEADER_RECORD_ID" ]]; then
+    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X POST \
+      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "$payload")
+    TG_LEADER_RECORD_ID=$(echo "$response" | jq -r '.result.id // empty')
+  else
+    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X PUT \
+      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${TG_LEADER_RECORD_ID}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "$payload")
+  fi
+
+  if echo "$response" | jq -e '.success == true' >/dev/null 2>&1; then
+    LEADER_NODE_ID="$NODE_ID"
+    LEADER_TS="$now"
+    return 0
+  else
+    log "ERROR: Kuandika leader record kumeshindikana. Response: $response"
+    return 1
+  fi
+}
+
+# Inarudisha 0 (kweli) kama node HII ndiyo kiongozi wa sasa (kwa
+# kuangalia heartbeat halisi kutoka Cloudflare, siyo kumbukumbu ya ndani).
+am_i_leader() {
+  get_leader_info
+  local now
+  now=$(date +%s)
+  if [[ "$LEADER_NODE_ID" == "$NODE_ID" ]] && (( now - LEADER_TS <= CF_TG_LEADER_TTL )); then
+    return 0
+  fi
+  if [[ -z "$LEADER_NODE_ID" ]] || (( now - LEADER_TS > CF_TG_LEADER_TTL )); then
+    # Hakuna kiongozi, au kiongozi wa zamani amekaa kimya muda mrefu -
+    # node hii inachukua nafasi papo hapo.
+    if claim_leadership; then
+      log "Node hii (${NODE_ID}) imekuwa KIONGOZI wa huduma ya Telegram."
+      return 0
+    fi
+  fi
+  return 1
+}
+
+########################################
 # SHARED CONFIG (NODE_PRIORITY / TARGET_RECORDS) - TXT record moja
 # kwenye Cloudflare, inayosomwa na server ZOTE kila run.
 ########################################
