@@ -1,0 +1,17 @@
+[Unit]
+Description=CF-Failover Telegram Bot (huduma ya amri za Telegram - papo hapo)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/cf-failover/cf-telegram-bot.sh
+Restart=always
+RestartSec=5
+User=root
+# Log inaenda kwenye journal (angalia kwa: journalctl -u cf-failover-telegram -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
