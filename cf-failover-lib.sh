@@ -381,11 +381,22 @@ get_shared_config() {
     return 0
   fi
 
-  local np tr
+  local np tr np_clean tr_clean
   np=$(echo "$content" | grep -o 'NODE_PRIORITY=[^;]*' | cut -d= -f2- || true)
   tr=$(echo "$content" | grep -o 'TARGET_RECORDS=[^;]*' | cut -d= -f2- || true)
-  [[ -n "$np" ]] && NODE_PRIORITY="$(dedup_csv "$np")"
-  [[ -n "$tr" ]] && TARGET_RECORDS="$(dedup_csv "$tr")"
+  np_clean=$(dedup_csv "$np")
+  tr_clean=$(dedup_csv "$tr")
+  [[ -n "$np" ]] && NODE_PRIORITY="$np_clean"
+  [[ -n "$tr" ]] && TARGET_RECORDS="$tr_clean"
+
+  # Kama marudio (duplicates) yamegunduliwa, yasafishe DIRECTLY kwenye
+  # Cloudflare papo hapo (usisubiri amri nyingine ya kuongeza/kuondoa) -
+  # hivyo node ZOTE (hata zile bado hazijasasishwa) zitaona toleo safi
+  # mara moja badala ya marudio kuendelea kubaki milele kwenye rekodi.
+  if [[ "$np" != "$np_clean" || "$tr" != "$tr_clean" ]]; then
+    log "Marudio (duplicates) yamegunduliwa kwenye NODE_PRIORITY/TARGET_RECORDS - yanasafishwa sasa."
+    save_shared_config
+  fi
 }
 
 save_shared_config() {
