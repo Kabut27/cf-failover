@@ -1,7 +1,8 @@
 # 🔁 cf-failover
 
-**Automatic Cloudflare DNS failover** kwa multi-node servers (3x-ui/Xray n.k).
-Domain zako zinaelekezwa kiotomatiki kwenye node ya kwanza inayofanya kazi.
+**DNS failover ya kiotomatiki kwenye Cloudflare** kwa multi-node servers
+(3x-ui/Xray n.k). Domain zako zinaelekezwa kiotomatiki kwenye node ya
+kwanza inayofanya kazi, na kila kitu kinadhibitiwa kupitia Telegram.
 
 ---
 
@@ -9,45 +10,32 @@ Domain zako zinaelekezwa kiotomatiki kwenye node ya kwanza inayofanya kazi.
 
 - 🖥️ Nodes 2, 3, au zaidi kwa mpangilio wa priority
 - 🌐 Domain records kadhaa zinabadilishwa pamoja
-- 📡 Health check ya TCP au HTTP — kila dakika 1 kupitia `cron`
-- 🔒 Lock file — inazuia run mbili kugongana
-- 📲 Kudhibiti kila kitu kupitia **Telegram** (bila kugusa server), na
-  amri zinajibiwa **ndani ya sekunde 1-2** (huduma ya `systemd`, siyo
-  kusubiri dakika ya cron)
+- 📡 Health check (TCP/HTTP) kila dakika 1 kupitia `cron`
+- 📲 Kudhibiti kila kitu kupitia **Telegram** — amri zinajibiwa ndani
+  ya sekunde 1-2 (huduma ya `systemd`, siyo kusubiri cron)
 - 🧩 Sakinisha kwenye server zote kwa amri MOJA — hakuna server "kuu"
+- 👑 **Leader election** — node ZOTE zinaendesha huduma ya Telegram,
+  lakini moja tu inaongea na Telegram kwa wakati mmoja. Ikizima,
+  nyingine inachukua nafasi kiotomatiki ndani ya sekunde chache
+- ☁️ **Cloudflare pekee ndiyo chanzo cha data** — node/domain
+  HAZIHIFADHIWI kwenye VPS popote; zinasomwa moja kwa moja kutoka
+  Cloudflare kila run
+- 🧹 Kinga dhidi ya marudio (duplicates), na amri ya kusafisha yoyote
+  yaliyopo
 
 ---
 
-## 🧱 Muundo wa faili
+## ☁️ Data iko wapi?
 
-| Faili | Kazi | Inaendeshwa vipi |
-|---|---|---|
-| `cf-failover-lib.sh` | Functions zinazoshirikiwa (Cloudflare API, amri za /addip n.k.) | inasomwa (source) na faili nyingine mbili |
-| `cf-failover.sh` | Health-check ya nodes + kubadili DNS | `cron`, kila dakika 1 |
-| `cf-telegram-bot.sh` | Inasikiliza amri za Telegram muda wote na kujibu papo hapo | `systemd` service |
+| Data | Iko wapi |
+|---|---|
+| Node (IP) na Domain records | **Cloudflare pekee** (TXT record), hakuna copy VPS |
+| Cloudflare API Token / Zone ID | VPS (`/etc/cf-failover/config.env`) — inahitajika kuongea na Cloudflare |
+| Telegram Bot Token / Chat ID | VPS (`/etc/cf-failover/config.env`) |
+| "Kiongozi ni nani" (leader heartbeat) | Cloudflare (TXT record nyingine, kiufundi tu) |
 
-Health-check inabaki kila dakika 1 kimakusudi — kuifanya ya papo hapo
-kungesababisha DNS kubadilika mno node ikipepesuka (flap) na kuharibu
-utulivu wa mfumo. Amri za Telegram hazina sababu ya kusubiri hiyo dakika,
-kwa hiyo zina huduma yake tofauti inayosikiliza papo hapo.
-
----
-
-## 🤖 Amri za Telegram
-
-| Amri | Kazi |
-|------|------|
-| `/addip <ip> [nafasi]` | Ongeza node |
-| `/removeip <ip>` | Ondoa node |
-| `/setpriority <ip1,ip2,...>` | Badilisha orodha yote |
-| `/listips` | Onyesha nodes zote |
-| `/addrecord <domain>` | Ongeza domain |
-| `/removerecord <domain>` | Ondoa domain |
-| `/listrecords` | Onyesha domains zote |
-| `/refresh` au `/status` | Ripoti ya papo hapo |
-| `/help` | Onyesha amri zote |
-
-> ⚠️ Tumia bot ya Telegram **iliyotengwa** kwa cf-failover peke yake.
+Server yoyote mpya unayosakinisha inasoma node/domain zilizopo moja
+kwa moja kutoka Cloudflare — huhitaji kuweka chochote tena.
 
 ---
 
@@ -57,10 +45,14 @@ kwa hiyo zina huduma yake tofauti inayosikiliza papo hapo.
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Kabut27/cf-failover/main/install.sh)"
 ```
 
-Installer itakuuliza Cloudflare Token/Zone ID, node priority, domain
-records, na (hiari) Telegram Bot Token/Chat ID. Ukiweka Telegram Bot
-Token, huduma ya `systemd` ya Telegram itawashwa moja kwa moja kwenye
-server hiyo hiyo.
+Installer itakuuliza Cloudflare Token/Zone ID, jina la config record,
+mipangilio ya health-check, na (hiari) Telegram Bot Token/Chat ID.
+**Haitakuuliza node wala domain** — hizo unaziongeza baadaye kupitia
+Telegram, mara moja tu (zitasambaa kiotomatiki kwenye server zote).
+
+Ukiweka Telegram Bot Token, huduma ya `systemd` ya Telegram itawashwa
+moja kwa moja kwenye server hiyo hiyo. Tumia **Token/Chat ID/Config
+record name SAWA** kwenye server zote unazosakinisha.
 
 ---
 
@@ -72,6 +64,11 @@ tail -f /var/log/cf-failover.log
 
 # Huduma ya Telegram (systemd)
 journalctl -u cf-failover-telegram -f
+```
+
+Kutambua ni server ipi ni "kiongozi" wa Telegram kwa sasa:
+```bash
+journalctl -u cf-failover-telegram -n 5 --no-pager
 ```
 
 ## 🗑️ Kuondoa
