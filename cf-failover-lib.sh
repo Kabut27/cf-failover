@@ -1,670 +1,646 @@
 #!/bin/bash
 #
-# cf-failover-lib.sh
-#
-# Maktaba (library) inayoshirikiwa na SCRIPT MBILI tofauti:
-#   1. cf-failover.sh       -> inakimbia kila dakika 1 kupitia cron
-#                              (health-check + DNS failover TU)
-#   2. cf-telegram-bot.sh   -> huduma ya systemd inayosikiliza Telegram
-#                              muda wote (amri za /addip n.k., papo hapo)
-#
-# Faili hii haikimbizwi peke yake - ni lazima 'source'-iwe na moja ya
-# script mbili hapo juu. Kusudi lake ni kuepusha kunakili msimbo mara
-# mbili (Cloudflare API calls, uthibitishaji wa IP/domain, n.k.) na
-# kuhakikisha zote mbili zinatumia mantiki ile ile kabisa.
+# cf-failover-lib.sh (v2.0 Professional Edition)
+# Maktaba kuu inayotumiwa na cf-failover.sh na cf-telegram-bot.sh
 
 ########################################
-# LOG
+# 1. LOGGING & NODE IDENTITY
 ########################################
+CF_TG_HEARTBEAT_INTERVAL="${CF_TG_HEARTBEAT_INTERVAL:-30}"
+CF_TG_LEADER_TTL="${CF_TG_LEADER_TTL:-90}"
+CURL_TIMEOUT="${CURL_TIMEOUT:-10}"
+CHECK_TIMEOUT="${CHECK_TIMEOUT:-5}"
+CHECK_PORT="${CHECK_PORT:-443}"
+CHECK_METHOD="${CHECK_METHOD:-tcp}"
+HEALTH_PATH="${HEALTH_PATH:-/}"
+CHECK_SCHEME="${CHECK_SCHEME:-https}"
+DNS_TTL="${DNS_TTL:-60}"
+DEFAULT_PROXIED="${DEFAULT_PROXIED:-false}"
+
 log() {
-  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
-########################################
-# TELEGRAM - KUTUMA UJUMBE
-########################################
-notify_telegram() {
-  local message="$1"
-  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
-    return 0   # arifa hazijawekwa, ruka kimya
-  fi
-  local response
-  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
-    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=${message}" \
-    --data-urlencode "parse_mode=Markdown" 2>/dev/null)
-
-  if ! echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
-    # Ujumbe una alama za Markdown zisizolingana (_, *, `) - Telegram
-    # inakataa kutuma kimya kimya. Jaribu tena BILA parse_mode ili
-    # ujumbe ufike kwa hali yoyote, badala ya kupotea kabisa.
-    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
-      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-      --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-      --data-urlencode "text=${message}" 2>/dev/null)
-    if ! echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
-      log "ONYO: Kutuma Telegram alert kumeshindikana kabisa. Response: $response"
-      return 1
-    fi
-  fi
-  return 0
-}
-
-# Muundo wa keyboard - vitufe vinavyoonekana chini ya uwanja wa kuandika
-MAIN_KEYBOARD_JSON='{"keyboard":[["➕ Ongeza Node","➖ Ondoa Node"],["🎯 Weka Priority","📋 Orodha Nodes"],["🌐 Ongeza Domain","🗑️ Ondoa Domain"],["📄 Orodha Domains","🔄 Refresh"],["🧹 Safisha Marudio"],["ℹ️ Msaada"]],"resize_keyboard":true}'
-
-notify_telegram_kb() {
-  local message="$1"
-  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+ensure_node_id() {
+  local id_file="/etc/cf-failover/node-id"
+  if [[ -n "${NODE_ID:-}" ]]; then
     return 0
   fi
-  local response
-  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
-    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=${message}" \
-    --data-urlencode "parse_mode=Markdown" \
-    --data-urlencode "reply_markup=${MAIN_KEYBOARD_JSON}" 2>/dev/null)
-
-  if ! echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
-    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X POST \
-      "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-      --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-      --data-urlencode "text=${message}" \
-      --data-urlencode "reply_markup=${MAIN_KEYBOARD_JSON}" 2>/dev/null)
-    if ! echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
-      log "ONYO: Kutuma Telegram alert (na keyboard) kumeshindikana kabisa. Response: $response"
-      return 1
-    fi
+  if [[ -f "$id_file" ]]; then
+    NODE_ID="$(tr -d '[:space:]' < "$id_file")"
   fi
-  return 0
-}
-
-########################################
-# HEALTH CHECK (node moja)
-########################################
-check_node() {
-  local ip="$1"
-  if [[ "$CHECK_METHOD" == "http" ]]; then
-    local code
-    code=$(curl -k -s -o /dev/null -w '%{http_code}' --max-time "${CHECK_TIMEOUT:-5}" \
-      "${CHECK_SCHEME}://${ip}:${CHECK_PORT}${HEALTH_PATH}" 2>/dev/null || echo "000")
-    [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]
-  else
-    timeout "${CHECK_TIMEOUT:-5}" bash -c "cat < /dev/null > /dev/tcp/${ip}/${CHECK_PORT}" 2>/dev/null
+  if [[ -z "${NODE_ID:-}" ]]; then
+    local host_part rand_part
+    host_part="$(hostname -s 2>/dev/null | tr -cd 'a-zA-Z0-9_-' || echo "node")"
+    rand_part="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    NODE_ID="${host_part}-${rand_part}"
+    mkdir -p "$(dirname "$id_file")"
+    printf '%s\n' "$NODE_ID" > "$id_file"
   fi
-}
-
-# Inaangalia node ZOTE za NODE_PRIORITY sasa hivi (live), na kujaza:
-#   PRIORITY_ARR, NODE_STATUS_ARR, DESIRED_IP
-# Inatumika na cron (kwa failover) NA na bot (kwa /refresh ya papo hapo).
-health_check_all() {
-  IFS=',' read -ra PRIORITY_ARR <<< "$NODE_PRIORITY"
-  NODE_STATUS_ARR=()
-  DESIRED_IP=""
-  local ip
-  for ip in "${PRIORITY_ARR[@]}"; do
-    if check_node "$ip"; then
-      NODE_STATUS_ARR+=("1")
-      [[ -z "$DESIRED_IP" ]] && DESIRED_IP="$ip"
-    else
-      NODE_STATUS_ARR+=("0")
-    fi
-  done
-}
-
-# Inatengeneza ujumbe wa ripoti kutoka PRIORITY_ARR/NODE_STATUS_ARR/DESIRED_IP
-# zilizopo tayari (haifanyi health-check upya - tumia health_check_all kabla
-# kama data hiyo bado haipo).
-format_status_report() {
-  local report="📊 *CF-Failover — Ripoti ya Hali*
-━━━━━━━━━━━━━━━"
-  local idx=1 ip
-  for ip in "${PRIORITY_ARR[@]}"; do
-    if [[ "${NODE_STATUS_ARR[$((idx-1))]:-0}" == "1" ]]; then
-      report="${report}
-✅ Node ${idx} (\`${ip}\`) — Iko hai"
-    else
-      report="${report}
-❌ Node ${idx} (\`${ip}\`) — Haipatikani"
-    fi
-    idx=$((idx + 1))
-  done
-  report="${report}
-━━━━━━━━━━━━━━━
-🎯 Inayotumika sasa: \`${DESIRED_IP:-hakuna}\`
-🕒 $(date '+%H:%M:%S | %d-%m-%Y')"
-  echo "$report"
-}
-
-# Ripoti ya PAPO HAPO - inafanya health-check yake yenyewe (haitegemei cron).
-# Hii ndiyo inayotumiwa na bot kwa /refresh, /status, na kitufe "🔄 Refresh"
-# ili jibu lipatikane ndani ya sekunde chache bila kusubiri run ya cron.
-send_status_report_live() {
-  health_check_all
-  notify_telegram "$(format_status_report)"
+  export NODE_ID
 }
 
 ########################################
-# VALIDATION
+# 2. VALIDATION HELPERS (PURE BASH)
 ########################################
 is_valid_ip() {
   local ip="$1"
-  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
-  local part
-  for part in "${BASH_REMATCH[@]:1}"; do
-    (( part <= 255 )) || return 1
+  local IFS='.'
+  local -a octets
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  read -r -a octets <<< "$ip"
+  [[ ${#octets[@]} -eq 4 ]] || return 1
+  local o
+  for o in "${octets[@]}"; do
+    (( 10#$o >= 0 && 10#$o <= 255 )) || return 1
   done
   return 0
 }
 
 is_valid_domain() {
-  local d="$1"
-  [[ "$d" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]
+  local d="${1,,}"
+  [[ ${#d} -le 253 ]] || return 1
+  [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] || return 1
+  return 0
 }
 
 ########################################
-# CLOUDFLARE API - DNS records za kawaida (A records za failover)
+# 3. SECURE CLOUDFLARE API ENGINE
 ########################################
-get_record_info() {
-  local record_name="$1"
-  local response
-  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X GET \
-    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=A&name=${record_name}" \
-    -H "Authorization: Bearer ${CF_API_TOKEN}" \
-    -H "Content-Type: application/json")
+# Inaficha CF_API_TOKEN isionekane kwenye 'ps aux' na inarudia mara 2 kukitokea hitilafu ya mtandao
+cf_api() {
+  local method="$1"
+  local endpoint="$2"
+  local data="${3:-}"
+  local url="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}${endpoint}"
+  local attempt=1 max_attempts=2 response=""
 
-  local rid rip
-  rid=$(echo "$response" | jq -r '.result[0].id // empty')
-  rip=$(echo "$response" | jq -r '.result[0].content // empty')
-  echo "${rid}|${rip}"
-}
+  while (( attempt <= max_attempts )); do
+    if [[ -n "$data" ]]; then
+      response=$(curl -sS --connect-timeout 5 --max-time "${CURL_TIMEOUT}" -X "$method" \
+        -H "Content-Type: application/json" \
+        --data "$data" \
+        --config - <<EOF 2>/dev/null
+url = "${url}"
+header = "Authorization: Bearer ${CF_API_TOKEN}"
+EOF
+      ) && break
+    else
+      response=$(curl -sS --connect-timeout 5 --max-time "${CURL_TIMEOUT}" -X "$method" \
+        -H "Content-Type: application/json" \
+        --config - <<EOF 2>/dev/null
+url = "${url}"
+header = "Authorization: Bearer ${CF_API_TOKEN}"
+EOF
+      ) && break
+    fi
+    attempt=$(( attempt + 1 ))
+    sleep 1
+  done
 
-create_dns() {
-  local record_name="$1"
-  local new_ip="$2"
-  local payload response
-  payload=$(jq -n --arg name "$record_name" --arg ip "$new_ip" --argjson ttl "${DNS_TTL:-60}" \
-    '{type:"A",name:$name,content:$ip,ttl:$ttl,proxied:false}')
-
-  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X POST \
-    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
-    -H "Authorization: Bearer ${CF_API_TOKEN}" \
-    -H "Content-Type: application/json" \
-    --data "$payload")
-
-  if echo "$response" | jq -e '.success == true' >/dev/null 2>&1; then
-    log "${record_name} imetengenezwa mpya ikielekeza ${new_ip}"
-    return 0
-  else
-    log "ERROR: Kutengeneza ${record_name} kumeshindikana. Response: $response"
-    return 1
-  fi
-}
-
-upsert_dns() {
-  local record_name="$1"
-  local record_id="$2"
-  local new_ip="$3"
-
-  if [[ -z "$record_id" ]]; then
-    create_dns "$record_name" "$new_ip"
-    return $?
-  fi
-
-  local payload response
-  payload=$(jq -n --arg name "$record_name" --arg ip "$new_ip" --argjson ttl "${DNS_TTL:-60}" \
-    '{type:"A",name:$name,content:$ip,ttl:$ttl,proxied:false}')
-
-  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X PUT \
-    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
-    -H "Authorization: Bearer ${CF_API_TOKEN}" \
-    -H "Content-Type: application/json" \
-    --data "$payload")
-
-  if echo "$response" | jq -e '.success == true' >/dev/null 2>&1; then
-    log "${record_name} imebadilishwa kuelekeza ${new_ip}"
-    return 0
-  else
-    log "ERROR: Kubadilisha ${record_name} kumeshindikana. Response: $response"
-    return 1
-  fi
+  [[ -n "$response" ]] || return 1
+  printf '%s' "$response"
 }
 
 ########################################
-# TELEGRAM LEADER ELECTION - inaruhusu server ZOTE kuendesha
-# cf-telegram-bot.sh (usanifu ule ule wa "hakuna server kuu"), lakini
-# NODE MOJA TU ndiyo inayozungumza na Telegram kwa wakati mmoja
-# (Telegram haikubali watumaji wawili wa getUpdates kwa token moja).
-#
-# Jinsi inavyofanya kazi: TXT record MOJA kwenye Cloudflare inashikilia
-# "NODE_ID=<id>;TS=<epoch>" ya node inayoongoza sasa (heartbeat). Kila
-# node isiyo kiongozi inaangalia record hii mara kwa mara; kiongozi
-# akikaa kimya zaidi ya CF_TG_LEADER_TTL sekunde (amezima/amekufa),
-# node ya kwanza kugundua inajitangaza kiongozi papo hapo - hakuna
-# mtu wa kubofya chochote, inatokea kiotomatiki.
+# 4. SHARED CONFIG (CLOUDFLARE TXT RECORD)
 ########################################
-CF_TG_LEADER_TTL="${CF_TG_LEADER_TTL:-45}"      # sekunde - kiongozi akikaa kimya zaidi ya hii, anahesabiwa amekufa
-CF_TG_HEARTBEAT_INTERVAL="${CF_TG_HEARTBEAT_INTERVAL:-15}"  # kila sekunde ngapi kiongozi anasasisha heartbeat yake
-TG_LEADER_RECORD_ID=""
-LEADER_NODE_ID=""
-LEADER_TS=0
+update_txt_record() {
+  local rec_name="$1"
+  local content="$2"
+  local resp rec_id payload
 
-# Kitambulisho cha kudumu cha node hii - kinabaki kile kile hata baada
-# ya reboot/restart, ili "uongozi" usibadilike bila sababu.
-ensure_node_id() {
-  local id_file="/etc/cf-failover/node-id"
-  if [[ -f "$id_file" ]]; then
-    NODE_ID="$(cat "$id_file")"
-  else
-    NODE_ID="$(hostname 2>/dev/null || echo node)-$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c6)"
-    mkdir -p "$(dirname "$id_file")"
-    echo "$NODE_ID" > "$id_file"
-  fi
-}
+  resp=$(cf_api GET "/dns_records?type=TXT&name=${rec_name}") || return 1
+  jq -e '.success == true' <<< "$resp" >/dev/null 2>&1 || return 1
 
-get_leader_info() {
-  local response count
-  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X GET \
-    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=TXT&name=${TG_LEADER_RECORD_NAME}" \
-    -H "Authorization: Bearer ${CF_API_TOKEN}" \
-    -H "Content-Type: application/json")
+  rec_id=$(jq -r '.result[0].id // empty' <<< "$resp")
+  payload=$(jq -nc --arg name "$rec_name" --arg content "$content" \
+    '{type:"TXT", name:$name, content:$content, ttl:60}')
 
-  count=$(echo "$response" | jq -r '.result | length // 0' 2>/dev/null || echo 0)
-
-  if [[ "$count" -gt 1 ]]; then
-    # Cloudflare inaruhusu rekodi zaidi ya moja zenye JINA lile lile -
-    # hii ndiyo ilisababisha node mbili tofauti kuamini kila moja ni
-    # "kiongozi" (kila moja ikisoma rekodi tofauti). Tunabakiza rekodi
-    # yenye heartbeat YA HIVI KARIBUNI ZAIDI (TS kubwa zaidi) kama
-    # "kweli", na kufuta zote nyingine papo hapo.
-    log "ONYO: Rekodi za kiongozi ${count} zenye jina moja (${TG_LEADER_RECORD_NAME}) zimegunduliwa - zinasafishwa, moja pekee itabaki."
-    local winner_id winner_ts=-1 rid_i ts_i content_i
-    local n
-    n=$(echo "$response" | jq -r '.result | length')
-    for ((i=0; i<n; i++)); do
-      rid_i=$(echo "$response" | jq -r ".result[$i].id")
-      content_i=$(echo "$response" | jq -r ".result[$i].content")
-      ts_i=$(echo "$content_i" | grep -o 'TS=[0-9]*' | cut -d= -f2- || echo 0)
-      [[ -z "$ts_i" ]] && ts_i=0
-      if (( ts_i > winner_ts )); then
-        winner_ts="$ts_i"
-        winner_id="$rid_i"
-      fi
+  if [[ -n "$rec_id" ]]; then
+    resp=$(cf_api PUT "/dns_records/${rec_id}" "$payload") || return 1
+    # Futa marudio ya TXT record kama yapo
+    local extra_ids
+    extra_ids=$(jq -r '.result[1:][]?.id // empty' <<< "$resp" 2>/dev/null || true)
+    local eid
+    for eid in $extra_ids; do
+      cf_api DELETE "/dns_records/${eid}" >/dev/null 2>&1 || true
     done
-    for ((i=0; i<n; i++)); do
-      rid_i=$(echo "$response" | jq -r ".result[$i].id")
-      if [[ "$rid_i" != "$winner_id" ]]; then
-        curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X DELETE \
-          "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${rid_i}" \
-          -H "Authorization: Bearer ${CF_API_TOKEN}" >/dev/null 2>&1
-      fi
-    done
-    # Soma tena baada ya kusafisha ili tupate hali sahihi ya sasa.
-    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X GET \
-      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=TXT&name=${TG_LEADER_RECORD_NAME}" \
-      -H "Authorization: Bearer ${CF_API_TOKEN}" \
-      -H "Content-Type: application/json")
+  else
+    resp=$(cf_api POST "/dns_records" "$payload") || return 1
   fi
 
-  local rid content
-  rid=$(echo "$response" | jq -r '.result[0].id // empty')
-  content=$(echo "$response" | jq -r '.result[0].content // empty')
-  TG_LEADER_RECORD_ID="$rid"
-  LEADER_NODE_ID=$(echo "$content" | grep -o 'NODE_ID=[^;]*' | cut -d= -f2- || true)
-  LEADER_TS=$(echo "$content" | grep -o 'TS=[0-9]*' | cut -d= -f2- || echo 0)
-  [[ -z "$LEADER_TS" ]] && LEADER_TS=0
+  jq -e '.success == true' <<< "$resp" >/dev/null 2>&1
 }
 
-# Node hii inajitangaza (au inathibitisha) kuwa kiongozi sasa hivi.
+get_shared_config() {
+  local resp txt_val
+  resp=$(cf_api GET "/dns_records?type=TXT&name=${CONFIG_RECORD_NAME}") || return 1
+  jq -e '.success == true' <<< "$resp" >/dev/null 2>&1 || return 1
+
+  txt_val=$(jq -r '.result[0].content // empty' <<< "$resp")
+  txt_val="${txt_val#\"}"
+  txt_val="${txt_val%\"}"
+
+  if [[ -z "$txt_val" ]]; then
+    # Kama TXT haipo bado Cloudflare, na tuna data kwenye config.env, ianzishe
+    if [[ -n "${NODE_PRIORITY:-}" || -n "${TARGET_RECORDS:-}" ]]; then
+      save_shared_config || true
+    fi
+    return 0
+  fi
+
+  # Format inayokubaliwa: PRIORITY=1.1.1.1,2.2.2.2;RECORDS=a.com,b.com
+  local part key val
+  IFS=';' read -r -a parts <<< "$txt_val"
+  for part in "${parts[@]}"; do
+    key="${part%%=*}"
+    val="${part#*=}"
+    case "$key" in
+      PRIORITY|NODE_PRIORITY) NODE_PRIORITY="$val" ;;
+      RECORDS|TARGET_RECORDS) TARGET_RECORDS="$val" ;;
+    esac
+  done
+  export NODE_PRIORITY TARGET_RECORDS
+  return 0
+}
+
+save_shared_config() {
+  local content="PRIORITY=${NODE_PRIORITY:-};RECORDS=${TARGET_RECORDS:-}"
+  update_txt_record "$CONFIG_RECORD_NAME" "$content"
+}
+
+########################################
+# 5. DISTRIBUTED LEADER ELECTION (TELEGRAM)
+########################################
 claim_leadership() {
-  local now content payload response
-  now=$(date +%s)
-  content="NODE_ID=${NODE_ID};TS=${now}"
-  payload=$(jq -n --arg name "$TG_LEADER_RECORD_NAME" --arg content "$content" \
-    '{type:"TXT",name:$name,content:$content,ttl:60}')
-
-  if [[ -z "$TG_LEADER_RECORD_ID" ]]; then
-    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X POST \
-      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
-      -H "Authorization: Bearer ${CF_API_TOKEN}" \
-      -H "Content-Type: application/json" \
-      --data "$payload")
-    TG_LEADER_RECORD_ID=$(echo "$response" | jq -r '.result.id // empty')
-  else
-    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X PUT \
-      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${TG_LEADER_RECORD_ID}" \
-      -H "Authorization: Bearer ${CF_API_TOKEN}" \
-      -H "Content-Type: application/json" \
-      --data "$payload")
-  fi
-
-  if echo "$response" | jq -e '.success == true' >/dev/null 2>&1; then
-    LEADER_NODE_ID="$NODE_ID"
-    LEADER_TS="$now"
-    return 0
-  else
-    log "ERROR: Kuandika leader record kumeshindikana. Response: $response"
-    return 1
-  fi
-}
-
-# Inarudisha 0 (kweli) kama node HII ndiyo kiongozi wa sasa (kwa
-# kuangalia heartbeat halisi kutoka Cloudflare, siyo kumbukumbu ya ndani).
-am_i_leader() {
-  get_leader_info
+  ensure_node_id
   local now
   now=$(date +%s)
-  if [[ "$LEADER_NODE_ID" == "$NODE_ID" ]] && (( now - LEADER_TS <= CF_TG_LEADER_TTL )); then
+  if update_txt_record "$TG_LEADER_RECORD_NAME" "${NODE_ID}:${now}"; then
+    LEADER_NODE_ID="$NODE_ID"
     return 0
   fi
-  if [[ -z "$LEADER_NODE_ID" ]] || (( now - LEADER_TS > CF_TG_LEADER_TTL )); then
-    # Hakuna kiongozi, au kiongozi wa zamani amekaa kimya muda mrefu -
-    # node hii inachukua nafasi papo hapo.
-    if claim_leadership; then
-      log "Node hii (${NODE_ID}) imekuwa KIONGOZI wa huduma ya Telegram."
+  return 1
+}
+
+release_leadership() {
+  ensure_node_id
+  [[ -z "${TG_LEADER_RECORD_NAME:-}" ]] && return 0
+  update_txt_record "$TG_LEADER_RECORD_NAME" "${NODE_ID}:0" >/dev/null 2>&1 || true
+}
+
+am_i_leader() {
+  ensure_node_id
+  local resp txt_val leader_id leader_ts now age
+
+  resp=$(cf_api GET "/dns_records?type=TXT&name=${TG_LEADER_RECORD_NAME}") || return 1
+  jq -e '.success == true' <<< "$resp" >/dev/null 2>&1 || return 1
+
+  txt_val=$(jq -r '.result[0].content // empty' <<< "$resp")
+  txt_val="${txt_val#\"}"
+  txt_val="${txt_val%\"}"
+
+  now=$(date +%s)
+
+  if [[ -n "$txt_val" && "$txt_val" == *:* ]]; then
+    leader_id="${txt_val%%:*}"
+    leader_ts="${txt_val##*:}"
+    [[ "$leader_ts" =~ ^[0-9]+$ ]] || leader_ts=0
+    age=$(( now - leader_ts ))
+
+    if [[ "$leader_id" == "$NODE_ID" ]] && (( age < CF_TG_LEADER_TTL )); then
+      LEADER_NODE_ID="$NODE_ID"
       return 0
+    elif (( age < CF_TG_LEADER_TTL )); then
+      LEADER_NODE_ID="$leader_id"
+      return 1
     fi
+  fi
+
+  # Hakuna kiongozi au muda wa kiongozi wa zamani umeisha -> Dai uongozi!
+  if claim_leadership; then
+    sleep 2
+    # Hakiki tena baada ya sekunde 2 kuzuia race condition kama node 2 zilidai pamoja
+    resp=$(cf_api GET "/dns_records?type=TXT&name=${TG_LEADER_RECORD_NAME}") || return 1
+    txt_val=$(jq -r '.result[0].content // empty' <<< "$resp")
+    txt_val="${txt_val#\"}"
+    txt_val="${txt_val%\"}"
+    leader_id="${txt_val%%:*}"
+    LEADER_NODE_ID="$leader_id"
+    [[ "$leader_id" == "$NODE_ID" ]] && return 0
   fi
   return 1
 }
 
 ########################################
-# SHARED CONFIG (NODE_PRIORITY / TARGET_RECORDS) - TXT record moja
-# kwenye Cloudflare, inayosomwa na server ZOTE kila run.
+# 6. PARALLEL HEALTH CHECK ENGINE
 ########################################
-SHARED_CONFIG_RECORD_ID=""
+check_node_health() {
+  local ip="$1"
+  local method="${CHECK_METHOD,,}"
 
-# Inaondoa marudio (duplicates) kwenye orodha ya CSV, ikitunza mpangilio
-# wa mara ya kwanza kila kipengele kilipoonekana. Hii inazuia hitilafu
-# za "domain/IP imejirudia mara mbili" zinazoweza kutokea kama node
-# mbili zote mbili ziliongeza kipengele kile kile karibu wakati mmoja.
-dedup_csv() {
-  local input="$1"
-  local -A seen=()
-  local out=() item
-  IFS=',' read -ra __arr <<< "$input"
-  for item in "${__arr[@]}"; do
-    [[ -z "$item" ]] && continue
-    if [[ -z "${seen[$item]:-}" ]]; then
-      seen["$item"]=1
-      out+=("$item")
+  if [[ "$method" == "http" || "$method" == "https" ]]; then
+    local url="${CHECK_SCHEME}://${ip}:${CHECK_PORT}${HEALTH_PATH}"
+    local code
+    code=$(curl -sS -k -o /dev/null -w "%{http_code}" \
+      --connect-timeout "${CHECK_TIMEOUT}" \
+      --max-time "${CHECK_TIMEOUT}" "$url" 2>/dev/null || echo "000")
+    [[ "$code" =~ ^[23][0-9]{2}$ ]] && return 0
+    return 1
+  else
+    # TCP check kupitia curl (inafanya kazi hata bila nc/netcat) au timeout + /dev/tcp
+    if command -v timeout >/dev/null 2>&1; then
+      timeout "${CHECK_TIMEOUT}" bash -c "exec 3<>/dev/tcp/${ip}/${CHECK_PORT}" 2>/dev/null && return 0
     fi
-  done
-  local result
-  result=$(IFS=,; echo "${out[*]}")
-  echo "$result"
-}
-
-get_shared_config() {
-  local response rid content count
-  response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X GET \
-    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=TXT&name=${CONFIG_RECORD_NAME}" \
-    -H "Authorization: Bearer ${CF_API_TOKEN}" \
-    -H "Content-Type: application/json")
-
-  if [[ -z "$response" ]]; then
-    log "ERROR: get_shared_config - Cloudflare haikurudisha jibu lolote (mtandao/timeout?). NODE_PRIORITY/TARGET_RECORDS ya sasa itaendelea kutumika."
+    curl -sS --connect-timeout "${CHECK_TIMEOUT}" --max-time "${CHECK_TIMEOUT}" \
+      "telnet://${ip}:${CHECK_PORT}" >/dev/null 2>&1 &
+    local pid=$!
+    sleep 0.1
+    kill "$pid" 2>/dev/null || true
     return 1
   fi
+}
 
-  count=$(echo "$response" | jq -r '.result | length // 0' 2>/dev/null || echo 0)
-  if [[ "$count" -gt 1 ]]; then
-    # Rekodi zaidi ya moja zenye jina moja (${CONFIG_RECORD_NAME}) -
-    # bakiza yenye maudhui MENGI zaidi (yaani orodha kubwa zaidi ya
-    # node/domain - hii ndiyo yenye uwezekano mkubwa wa kuwa "kamili
-    # zaidi"), futa nyingine.
-    log "ONYO: Rekodi za config ${count} zenye jina moja (${CONFIG_RECORD_NAME}) zimegunduliwa - zinasafishwa, moja pekee itabaki."
-    local winner_id winner_len=-1 rid_i content_i len_i n
-    n=$(echo "$response" | jq -r '.result | length')
-    for ((i=0; i<n; i++)); do
-      rid_i=$(echo "$response" | jq -r ".result[$i].id")
-      content_i=$(echo "$response" | jq -r ".result[$i].content")
-      len_i="${#content_i}"
-      if (( len_i > winner_len )); then
-        winner_len="$len_i"
-        winner_id="$rid_i"
+# Inakagua IP zote KWA WAKATI MMOJA (Parallel) na kuhifadhi matokeo kwenye associative array NODE_HEALTH_MAP
+declare -gA NODE_HEALTH_MAP=()
+
+check_all_nodes_parallel() {
+  NODE_HEALTH_MAP=()
+  [[ -z "${NODE_PRIORITY:-}" ]] && return 0
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d "/tmp/cf-hc.XXXXXX")
+  local -a ips
+  IFS=',' read -r -a ips <<< "$NODE_PRIORITY"
+
+  local ip
+  for ip in "${ips[@]}"; do
+    [[ -z "$ip" ]] && continue
+    (
+      if check_node_health "$ip"; then
+        printf 'UP' > "${tmp_dir}/${ip}"
+      else
+        printf 'DOWN' > "${tmp_dir}/${ip}"
       fi
-    done
-    for ((i=0; i<n; i++)); do
-      rid_i=$(echo "$response" | jq -r ".result[$i].id")
-      if [[ "$rid_i" != "$winner_id" ]]; then
-        curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" -X DELETE \
-          "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${rid_i}" \
-          -H "Authorization: Bearer ${CF_API_TOKEN}" >/dev/null 2>&1
-      fi
-    done
-    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X GET \
-      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=TXT&name=${CONFIG_RECORD_NAME}" \
-      -H "Authorization: Bearer ${CF_API_TOKEN}" \
-      -H "Content-Type: application/json")
-  fi
+    ) &
+  done
+  wait
 
-  rid=$(echo "$response" | jq -r '.result[0].id // empty')
-  content=$(echo "$response" | jq -r '.result[0].content // empty')
-  SHARED_CONFIG_RECORD_ID="$rid"
+  for ip in "${ips[@]}"; do
+    [[ -z "$ip" ]] && continue
+    if [[ -f "${tmp_dir}/${ip}" && "$(cat "${tmp_dir}/${ip}")" == "UP" ]]; then
+      NODE_HEALTH_MAP["$ip"]="UP"
+    else
+      NODE_HEALTH_MAP["$ip"]="DOWN"
+    fi
+  done
 
-  if [[ -z "$rid" ]]; then
-    log "Shared config record (${CONFIG_RECORD_NAME}) haipo bado - inatengenezwa kwa mara ya kwanza."
-    save_shared_config
+  rm -rf "$tmp_dir"
+}
+
+########################################
+# 7. TELEGRAM UI & NOTIFICATIONS
+########################################
+notify_telegram() {
+  local message="$1"
+  [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
+
+  local keyboard payload
+  keyboard=$(jq -nc '{
+    keyboard: [
+      [{text: "🔄 Refresh"}, {text: "📋 Orodha Nodes"}, {text: "📄 Orodha Domains"}],
+      [{text: "➕ Ongeza Node"}, {text: "➖ Ondoa Node"}, {text: "🎯 Weka Priority"}],
+      [{text: "🌐 Ongeza Domain"}, {text: "🗑️ Ondoa Domain"}, {text: "🧹 Safisha Marudio"}],
+      [{text: "ℹ️ Msaada"}, {text: "❌ Ghairi"}]
+    ],
+    resize_keyboard: true,
+    is_persistent: true
+  }')
+
+  payload=$(jq -nc \
+    --arg chat_id "$TELEGRAM_CHAT_ID" \
+    --arg text "$message" \
+    --argjson reply_markup "$keyboard" \
+    '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: $reply_markup}')
+
+  curl -sS --connect-timeout 5 --max-time "${CURL_TIMEOUT}" \
+    -H "Content-Type: application/json" \
+    --data "$payload" \
+    --config - <<EOF >/dev/null 2>&1 || true
+url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+EOF
+}
+
+########################################
+# 8. BOT COMMAND HANDLERS
+########################################
+handle_listips() {
+  if [[ -z "${NODE_PRIORITY:-}" ]]; then
+    notify_telegram "📋 *Orodha ya Nodes:* Hakuna IP iliyoongezwa bado. Bonyeza *➕ Ongeza Node*."
     return 0
   fi
 
-  local np tr
-  np=$(echo "$content" | grep -o 'NODE_PRIORITY=[^;]*' | cut -d= -f2- || true)
-  tr=$(echo "$content" | grep -o 'TARGET_RECORDS=[^;]*' | cut -d= -f2- || true)
-  # Dedup TU kwenye kumbukumbu ya muda (kwa matumizi ya papo hapo) -
-  # HATUANDIKI moja kwa moja kwenda Cloudflare hapa. Kuandika papo hapo
-  # kutoka mchakato WOWOTE (cron ya kila server, kila dakika) ni chanzo
-  # cha mgongano (race) kinachoweza KUONGEZA marudio badala ya
-  # kuyaondoa. Usafi wa kudumu unafanywa kwa amri ya mkono
-  # ("🧹 Safisha Marudio"), inayotekelezwa na kiongozi PEKEE.
-  [[ -n "$np" ]] && NODE_PRIORITY="$(dedup_csv "$np")"
-  [[ -n "$tr" ]] && TARGET_RECORDS="$(dedup_csv "$tr")"
-}
+  check_all_nodes_parallel
 
-save_shared_config() {
-  NODE_PRIORITY="$(dedup_csv "$NODE_PRIORITY")"
-  TARGET_RECORDS="$(dedup_csv "$TARGET_RECORDS")"
-  local content="NODE_PRIORITY=${NODE_PRIORITY};TARGET_RECORDS=${TARGET_RECORDS}"
-  local payload response
-  payload=$(jq -n --arg name "$CONFIG_RECORD_NAME" --arg content "$content" \
-    '{type:"TXT",name:$name,content:$content,ttl:60}')
-
-  if [[ -z "$SHARED_CONFIG_RECORD_ID" ]]; then
-    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X POST \
-      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
-      -H "Authorization: Bearer ${CF_API_TOKEN}" \
-      -H "Content-Type: application/json" \
-      --data "$payload")
-    SHARED_CONFIG_RECORD_ID=$(echo "$response" | jq -r '.result.id // empty')
-  else
-    response=$(curl -s --connect-timeout 5 --max-time "${CURL_TIMEOUT:-10}" --retry 1 --retry-delay 1 -X PUT \
-      "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${SHARED_CONFIG_RECORD_ID}" \
-      -H "Authorization: Bearer ${CF_API_TOKEN}" \
-      -H "Content-Type: application/json" \
-      --data "$payload")
-  fi
-
-  if ! echo "$response" | jq -e '.success == true' >/dev/null 2>&1; then
-    log "ERROR: Kuhifadhi shared config (${CONFIG_RECORD_NAME}) kumeshindikana. Response: $response"
-    notify_telegram "⚠️ Kuhifadhi mabadiliko ya config kwenye Cloudflare kumeshindikana. Angalia logs."
-  fi
-}
-
-########################################
-# AMRI ZA KUBADILI CONFIG (addip, removeip, n.k.)
-# Zinatumika na cf-telegram-bot.sh PEKEE (hizi ndizo amri za mtumiaji).
-########################################
-handle_addip() {
-  local ip="$1" pos="${2:-}"
-  if ! is_valid_ip "$ip"; then
-    notify_telegram "❌ IP si sahihi: \`${ip}\`"
-    return
-  fi
-  IFS=',' read -ra arr <<< "$NODE_PRIORITY"
-  local existing
-  for existing in "${arr[@]}"; do
-    if [[ "$existing" == "$ip" ]]; then
-      notify_telegram "⚠️ \`${ip}\` tayari ipo kwenye orodha."
-      return
-    fi
-  done
-  if [[ -n "$pos" && "$pos" =~ ^[0-9]+$ && "$pos" -ge 1 && "$pos" -le $((${#arr[@]}+1)) ]]; then
-    arr=("${arr[@]:0:$((pos-1))}" "$ip" "${arr[@]:$((pos-1))}")
-  else
-    arr+=("$ip")
-  fi
-  NODE_PRIORITY=$(IFS=,; echo "${arr[*]}")
-  save_shared_config
-  notify_telegram "✅ Node imeongezwa: \`${ip}\`
-📋 Priority mpya: \`${NODE_PRIORITY}\`"
-}
-
-handle_removeip() {
-  local ip="$1"
-  IFS=',' read -ra arr <<< "$NODE_PRIORITY"
-  local newarr=() found=0 existing
-  for existing in "${arr[@]}"; do
-    if [[ "$existing" == "$ip" ]]; then found=1; continue; fi
-    newarr+=("$existing")
-  done
-  if [[ "$found" -eq 0 ]]; then
-    notify_telegram "⚠️ \`${ip}\` haipo kwenye orodha."
-    return
-  fi
-  if [[ "${#newarr[@]}" -eq 0 ]]; then
-    notify_telegram "❌ Haiwezekani kuondoa - lazima kuwe na node moja angalau."
-    return
-  fi
-  NODE_PRIORITY=$(IFS=,; echo "${newarr[*]}")
-  save_shared_config
-  notify_telegram "✅ Node imeondolewa: \`${ip}\`
-📋 Priority mpya: \`${NODE_PRIORITY}\`"
-}
-
-handle_cleanup() {
-  local np_before="$NODE_PRIORITY" tr_before="$TARGET_RECORDS"
-  local np_after tr_after removed_msg=""
-  np_after="$(dedup_csv "$NODE_PRIORITY")"
-  tr_after="$(dedup_csv "$TARGET_RECORDS")"
-
-  if [[ "$np_before" == "$np_after" && "$tr_before" == "$tr_after" ]]; then
-    notify_telegram_kb "✅ Hakuna marudio yaliyopatikana. Kila kitu ni safi tayari."
-    return
-  fi
-
-  NODE_PRIORITY="$np_after"
-  TARGET_RECORDS="$tr_after"
-  save_shared_config
-
-  [[ "$np_before" != "$np_after" ]] && removed_msg="${removed_msg}📍 Node Priority: \`${np_before}\` → \`${np_after}\`
-"
-  [[ "$tr_before" != "$tr_after" ]] && removed_msg="${removed_msg}🌐 Domain Records: \`${tr_before}\` → \`${tr_after}\`
-"
-
-  notify_telegram_kb "🧹 Marudio yamesafishwa:
-${removed_msg}"
-}
-
-handle_setpriority() {
-  local list="$1"
-  IFS=',' read -ra arr <<< "$list"
-  if [[ "${#arr[@]}" -eq 0 ]]; then
-    notify_telegram "❌ Orodha haiwezi kuwa tupu."
-    return
-  fi
-  local ip
-  for ip in "${arr[@]}"; do
-    if ! is_valid_ip "$ip"; then
-      notify_telegram "❌ IP si sahihi: \`${ip}\` - hakuna kilichobadilishwa."
-      return
-    fi
-  done
-  NODE_PRIORITY="$list"
-  save_shared_config
-  notify_telegram "✅ Priority mpya imewekwa: \`${NODE_PRIORITY}\`"
-}
-
-handle_listips() {
-  local msg="📋 *Node Priority (kwa mpangilio)*" idx=1 ip
-  IFS=',' read -ra arr <<< "$NODE_PRIORITY"
-  for ip in "${arr[@]}"; do
-    msg="${msg}
-${idx}. \`${ip}\`"
-    idx=$((idx+1))
+  local -a ips
+  IFS=',' read -r -a ips <<< "$NODE_PRIORITY"
+  local msg="📋 *Orodha ya Nodes kwa Kipaumbele (Priority):*"$'\n\n'
+  local idx=1 ip status icon
+  for ip in "${ips[@]}"; do
+    [[ -z "$ip" ]] && continue
+    status="${NODE_HEALTH_MAP[$ip]:-DOWN}"
+    [[ "$status" == "UP" ]] && icon="🟢 ONLINE" || icon="🔴 OFFLINE"
+    msg+="${idx}. \`${ip}\` — *${icon}*"$'\n'
+    idx=$(( idx + 1 ))
   done
   notify_telegram "$msg"
 }
 
-handle_addrecord() {
-  local d="${1,,}"
-  if ! is_valid_domain "$d"; then
-    notify_telegram "❌ Domain si sahihi: \`${d}\`"
-    return
+handle_listrecords() {
+  if [[ -z "${TARGET_RECORDS:-}" ]]; then
+    notify_telegram "📄 *Orodha ya Domains:* Hakuna domain iliyoongezwa bado. Bonyeza *🌐 Ongeza Domain*."
+    return 0
   fi
-  IFS=',' read -ra arr <<< "$TARGET_RECORDS"
-  local existing
-  for existing in "${arr[@]}"; do
-    if [[ "$existing" == "$d" ]]; then
-      notify_telegram "⚠️ \`${d}\` tayari ipo kwenye orodha."
-      return
+
+  local -a recs
+  IFS=',' read -r -a recs <<< "$TARGET_RECORDS"
+  local msg="📄 *Domains Zinazolindwa (Target Records):*"$'\n\n'
+  local idx=1 rec resp current_ip proxied proxy_icon
+  for rec in "${recs[@]}"; do
+    [[ -z "$rec" ]] && continue
+    resp=$(cf_api GET "/dns_records?type=A&name=${rec}" || true)
+    current_ip=$(jq -r '.result[0].content // "Haijawekwa"' <<< "$resp" 2>/dev/null || echo "Haijawekwa")
+    proxied=$(jq -r '.result[0].proxied // false' <<< "$resp" 2>/dev/null || echo "false")
+    [[ "$proxied" == "true" ]] && proxy_icon="☁️ Proxied" || proxy_icon="🛡️ DNS Only"
+    msg+="${idx}. \`${rec}\` ➡️ \`${current_ip}\` (${proxy_icon})"$'\n'
+    idx=$(( idx + 1 ))
+  done
+  notify_telegram "$msg"
+}
+
+handle_addip() {
+  local new_ip="${1:-}"
+  local pos="${2:-}"
+
+  if ! is_valid_ip "$new_ip"; then
+    notify_telegram "❌ *IP si sahihi:* \`${new_ip}\`. Tafadhali tuma IPv4 sahihi (mfano: \`1.2.3.4\`)."
+    return 1
+  fi
+
+  local -a ips=()
+  [[ -n "${NODE_PRIORITY:-}" ]] && IFS=',' read -r -a ips <<< "$NODE_PRIORITY"
+
+  local ip
+  for ip in "${ips[@]}"; do
+    if [[ "$ip" == "$new_ip" ]]; then
+      notify_telegram "ℹ️ IP \`${new_ip}\` tayari ipo kwenye orodha."
+      return 0
     fi
   done
-  arr+=("$d")
-  TARGET_RECORDS=$(IFS=,; echo "${arr[*]}")
-  save_shared_config
-  notify_telegram "✅ Domain imeongezwa: \`${d}\`
-📋 Records mpya: \`${TARGET_RECORDS}\`"
+
+  if [[ -n "$pos" && "$pos" =~ ^[0-9]+$ ]] && (( pos >= 1 && pos <= ${#ips[@]} + 1 )); then
+    local idx=$(( pos - 1 ))
+    ips=("${ips[@]:0:$idx}" "$new_ip" "${ips[@]:$idx}")
+  else
+    ips+=("$new_ip")
+  fi
+
+  local IFS=','
+  NODE_PRIORITY="${ips[*]}"
+  if save_shared_config; then
+    notify_telegram "✅ Node \`${new_ip}\` imeongezwa kikamilifu!
+📋 Priority mpya: \`${NODE_PRIORITY}\`"
+  else
+    notify_telegram "❌ Imeshindikana kuhifadhi mabadiliko kwenye Cloudflare TXT."
+  fi
+}
+
+handle_removeip() {
+  local target_ip="${1:-}"
+  if [[ -z "${NODE_PRIORITY:-}" ]]; then
+    notify_telegram "ℹ️ Hakuna nodes kwenye orodha kwa sasa."
+    return 0
+  fi
+
+  local -a ips new_ips=()
+  IFS=',' read -r -a ips <<< "$NODE_PRIORITY"
+  local ip found=0
+  for ip in "${ips[@]}"; do
+    if [[ "$ip" == "$target_ip" ]]; then
+      found=1
+    elif [[ -n "$ip" ]]; then
+      new_ips+=("$ip")
+    fi
+  done
+
+  if (( found == 0 )); then
+    notify_telegram "❌ IP \`${target_ip}\` haikupatikana kwenye orodha."
+    return 1
+  fi
+
+  local IFS=','
+  NODE_PRIORITY="${new_ips[*]}"
+  if save_shared_config; then
+    notify_telegram "🗑️ Node \`${target_ip}\` imeondolewa!
+📋 Priority iliyobaki: \`${NODE_PRIORITY:-Tupu}\`"
+  else
+    notify_telegram "❌ Imeshindikana kuhifadhi mabadiliko kwenye Cloudflare TXT."
+  fi
+}
+
+handle_setpriority() {
+  local raw_list="${1// /}"
+  local -a input_ips clean_ips=()
+  IFS=',' read -r -a input_ips <<< "$raw_list"
+
+  local ip
+  for ip in "${input_ips[@]}"; do
+    [[ -z "$ip" ]] && continue
+    if ! is_valid_ip "$ip"; then
+      notify_telegram "❌ IP \`${ip}\` si sahihi. Orodha haijabadilishwa."
+      return 1
+    fi
+    # Zuia marudio ndani ya orodha
+    local existing dup=0
+    for existing in "${clean_ips[@]}"; do
+      [[ "$existing" == "$ip" ]] && dup=1 && break
+    done
+    (( dup == 0 )) && clean_ips+=("$ip")
+  done
+
+  if (( ${#clean_ips[@]} == 0 )); then
+    notify_telegram "❌ Orodha ya IP ni tupu au si sahihi."
+    return 1
+  fi
+
+  local IFS=','
+  NODE_PRIORITY="${clean_ips[*]}"
+  if save_shared_config; then
+    notify_telegram "🎯 *Priority Mpya Imehifadhiwa:*
+\`${NODE_PRIORITY}\`"
+  else
+    notify_telegram "❌ Imeshindikana kuhifadhi priority mpya kwenye Cloudflare."
+  fi
+}
+
+handle_addrecord() {
+  local new_rec="${1,,}"
+  new_rec="${new_rec%.}"
+
+  if ! is_valid_domain "$new_rec"; then
+    notify_telegram "❌ *Domain si sahihi:* \`${new_rec}\`. Tuma mfano: \`cdn1.domain.com\`"
+    return 1
+  fi
+
+  local -a recs=()
+  [[ -n "${TARGET_RECORDS:-}" ]] && IFS=',' read -r -a recs <<< "$TARGET_RECORDS"
+
+  local r
+  for r in "${recs[@]}"; do
+    if [[ "${r,,}" == "$new_rec" ]]; then
+      notify_telegram "ℹ️ Domain \`${new_rec}\` tayari ipo kwenye orodha."
+      return 0
+    fi
+  done
+
+  recs+=("$new_rec")
+  local IFS=','
+  TARGET_RECORDS="${recs[*]}"
+
+  if save_shared_config; then
+    notify_telegram "✅ Domain \`${new_rec}\` imeongezwa kwenye ulinzi wa Failover!
+📄 Domains: \`${TARGET_RECORDS}\`"
+  else
+    notify_telegram "❌ Imeshindikana kuhifadhi domain kwenye Cloudflare TXT."
+  fi
 }
 
 handle_removerecord() {
-  local d="${1,,}"
-  IFS=',' read -ra arr <<< "$TARGET_RECORDS"
-  local newarr=() found=0 existing
-  for existing in "${arr[@]}"; do
-    if [[ "$existing" == "$d" ]]; then found=1; continue; fi
-    newarr+=("$existing")
+  local target_rec="${1,,}"
+  target_rec="${target_rec%.}"
+
+  local -a recs new_recs=()
+  IFS=',' read -r -a recs <<< "${TARGET_RECORDS:-}"
+  local r found=0
+  for r in "${recs[@]}"; do
+    if [[ "${r,,}" == "$target_rec" ]]; then
+      found=1
+    elif [[ -n "$r" ]]; then
+      new_recs+=("$r")
+    fi
   done
-  if [[ "$found" -eq 0 ]]; then
-    notify_telegram "⚠️ \`${d}\` haipo kwenye orodha."
-    return
+
+  if (( found == 0 )); then
+    notify_telegram "❌ Domain \`${target_rec}\` haikupatikana kwenye orodha."
+    return 1
   fi
-  if [[ "${#newarr[@]}" -eq 0 ]]; then
-    notify_telegram "❌ Haiwezekani kuondoa - lazima kuwe na domain moja angalau."
-    return
+
+  local IFS=','
+  TARGET_RECORDS="${new_recs[*]}"
+  if save_shared_config; then
+    notify_telegram "🗑️ Domain \`${target_rec}\` imeondolewa kwenye orodha ya Failover.
+📄 Domains zilizobaki: \`${TARGET_RECORDS:-Tupu}\`"
+  else
+    notify_telegram "❌ Imeshindikana kuhifadhi mabadiliko kwenye Cloudflare TXT."
   fi
-  TARGET_RECORDS=$(IFS=,; echo "${newarr[*]}")
-  save_shared_config
-  notify_telegram "✅ Domain imeondolewa: \`${d}\`
-📋 Records mpya: \`${TARGET_RECORDS}\`"
 }
 
-handle_listrecords() {
-  local msg="📋 *Domain Records*" idx=1 d
-  IFS=',' read -ra arr <<< "$TARGET_RECORDS"
-  for d in "${arr[@]}"; do
-    msg="${msg}
-${idx}. \`${d}\`"
-    idx=$((idx+1))
+handle_cleanup() {
+  local removed_count=0
+  local -a recs=()
+  [[ -n "${TARGET_RECORDS:-}" ]] && IFS=',' read -r -a recs <<< "$TARGET_RECORDS"
+
+  local rec resp extra_ids eid
+  for rec in "${recs[@]}"; do
+    [[ -z "$rec" ]] && continue
+    resp=$(cf_api GET "/dns_records?type=A&name=${rec}" || true)
+    extra_ids=$(jq -r '.result[1:][]?.id // empty' <<< "$resp" 2>/dev/null || true)
+    for eid in $extra_ids; do
+      if cf_api DELETE "/dns_records/${eid}" >/dev/null 2>&1; then
+        removed_count=$(( removed_count + 1 ))
+      fi
+    done
   done
+
+  # Safisha pia marudio kwenye TXT records za config na leader
+  local txt_name
+  for txt_name in "$CONFIG_RECORD_NAME" "${TG_LEADER_RECORD_NAME:-}"; do
+    [[ -z "$txt_name" ]] && continue
+    resp=$(cf_api GET "/dns_records?type=TXT&name=${txt_name}" || true)
+    extra_ids=$(jq -r '.result[1:][]?.id // empty' <<< "$resp" 2>/dev/null || true)
+    for eid in $extra_ids; do
+      if cf_api DELETE "/dns_records/${eid}" >/dev/null 2>&1; then
+        removed_count=$(( removed_count + 1 ))
+      fi
+    done
+  done
+
+  notify_telegram "🧹 *Usafishaji Umekamilika!*
+Rekodi za marudio (duplicates) zilizofutwa: *${removed_count}*"
+}
+
+send_status_report_live() {
+  ensure_node_id
+  check_all_nodes_parallel
+
+  local msg="📊 *RIPOTI YA HALI YA FAILOVER (LIVE)*"$'\n'
+  msg+="🤖 *Kiongozi wa Bot:* \`${NODE_ID}\`"$'\n'
+  msg+="🔍 *Check:* \`${CHECK_METHOD^^}:${CHECK_PORT}\` (Timeout: ${CHECK_TIMEOUT}s)"$'\n\n'
+
+  msg+="🖥️ *Hali ya Nodes (Priority Order):*"$'\n'
+  if [[ -z "${NODE_PRIORITY:-}" ]]; then
+    msg+="_Hakuna node iliyowekwa_"$'\n'
+  else
+    local -a ips
+    IFS=',' read -r -a ips <<< "$NODE_PRIORITY"
+    local i=1 ip st icon best_ip=""
+    for ip in "${ips[@]}"; do
+      [[ -z "$ip" ]] && continue
+      st="${NODE_HEALTH_MAP[$ip]:-DOWN}"
+      if [[ "$st" == "UP" ]]; then
+        icon="🟢 UP"
+        [[ -z "$best_ip" ]] && best_ip="$ip"
+      else
+        icon="🔴 DOWN"
+      fi
+      msg+="${i}. \`${ip}\` — *${icon}*"$'\n'
+      i=$(( i + 1 ))
+    done
+  fi
+
+  msg+=$'\n'"🌐 *Domains Zinazolindwa:*"$'\n'
+  if [[ -z "${TARGET_RECORDS:-}" ]]; then
+    msg+="_Hakuna domain iliyowekwa_"$'\n'
+  else
+    local -a recs
+    IFS=',' read -r -a recs <<< "$TARGET_RECORDS"
+    local rec resp cur_ip
+    for rec in "${recs[@]}"; do
+      [[ -z "$rec" ]] && continue
+      resp=$(cf_api GET "/dns_records?type=A&name=${rec}" || true)
+      cur_ip=$(jq -r '.result[0].content // "N/A"' <<< "$resp" 2>/dev/null || echo "N/A")
+      msg+="• \`${rec}\` ➡️ \`${cur_ip}\`"$'\n'
+    done
+  fi
+
   notify_telegram "$msg"
 }
 
 handle_help() {
-  notify_telegram_kb "🤖 *CF-Failover*
-━━━━━━━━━━━━━━━
-Tumia vitufe hapo chini, au amri za maandishi:
+  local msg="ℹ️ *MSAADA WA CLOUDFLARE FAILOVER BOT (v2.0)*
 
-/addip <ip> [nafasi] — ongeza node
-/removeip <ip> — ondoa node
-/setpriority <ip1,ip2,ip3> — badilisha orodha yote
-/listips — onyesha node zote
-/addrecord <domain> — ongeza domain
-/removerecord <domain> — ondoa domain
-/listrecords — onyesha domain zote
-/cleanup — safisha marudio yoyote (duplicates)
-/refresh au /status — ripoti ya papo hapo
-/help — onyesha ujumbe huu"
+Unaweza kutumia vitufe vya chini au kutuma amri moja kwa moja:
+
+🔹 `/status` au `/refresh` — Hali halisi ya nodes na DNS sasa hivi
+🔹 `/addip <ip> [nafasi]` — Kuongeza node mpya
+🔹 `/removeip <ip>` — Kuondoa node
+🔹 `/setpriority <ip1,ip2>` — Kupanga upya kipaumbele
+🔹 `/listips` — Kuona orodha ya nodes
+🔹 `/addrecord <domain>` — Kuongeza domain
+🔹 `/removerecord <domain>` — Kuondoa domain
+🔹 `/listrecords` — Kuona domains na IP zake
+🔹 `/cleanup` — Kufuta DNS records zilizojirudia
+🔹 `/cancel` — Kughairi hatua inayokusubiri"
+  notify_telegram "$msg"
 }
