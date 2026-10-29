@@ -7,6 +7,9 @@
 #   sudo bash install.sh             # Usakinishaji mpya au kubadilisha mipangilio
 #   sudo bash install.sh --upgrade   # Kusasisha scripts pekee bila kuuliza maswali
 #   sudo bash install.sh --uninstall # Kuondoa huduma kwenye server hii
+#
+# Pia inafanya kazi kupitia curl (inapakua faili zingine yenyewe kutoka GitHub):
+#   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Kabut27/cf-failover/main/install.sh)"
 
 set -uo pipefail
 
@@ -20,7 +23,17 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# BASH_SOURCE inaweza kuwa tupu kwa 'bash -c "$(curl ...)"', kwa hiyo tumia fallback salama
+_self="${BASH_SOURCE[0]:-}"
+if [[ -n "$_self" && -f "$_self" ]]; then
+  SRC_DIR="$(cd "$(dirname "$_self")" && pwd)"
+else
+  SRC_DIR="$(pwd)"
+fi
+
+RAW_BASE="https://raw.githubusercontent.com/Kabut27/cf-failover/main"
+REQUIRED_FILES=(cf-failover-lib.sh cf-failover.sh cf-telegram-bot.sh)
+
 INSTALL_DIR="/opt/cf-failover"
 CONFIG_DIR="/etc/cf-failover"
 CONFIG_FILE="${CONFIG_DIR}/config.env"
@@ -39,6 +52,11 @@ err()   { printf "${RED}[KOSA]${NC} %s\n" "$*" >&2; }
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   err "Tafadhali endesha script hii kama root: sudo bash install.sh"
   exit 1
+fi
+
+# Kama script inaendeshwa kwa pipe (curl | bash), rudisha input kwenye terminal
+if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
+  exec < /dev/tty
 fi
 
 MODE="${1:-install}"
@@ -69,16 +87,8 @@ if [[ "$MODE" == "--uninstall" || "$MODE" == "uninstall" ]]; then
 fi
 
 ########################################
-# 3. KUKAGUA FAILI NA KUSAKINISHA VIFURUSHI
+# 3. KUSAKINISHA VIFURUSHI NA KUPATA FAILI
 ########################################
-for req_file in cf-failover-lib.sh cf-failover.sh cf-telegram-bot.sh; do
-  if [[ ! -f "${SRC_DIR}/${req_file}" ]]; then
-    err "Faili '${req_file}' halikupatikana ndani ya ${SRC_DIR}!"
-    err "Hakikisha install.sh iko kwenye folder moja na cf-failover-lib.sh, cf-failover.sh, na cf-telegram-bot.sh."
-    exit 1
-  fi
-done
-
 install_dependencies() {
   local missing=()
   command -v curl >/dev/null 2>&1 || missing+=("curl")
@@ -106,7 +116,29 @@ install_dependencies() {
   ok "Vifurushi vimesakinishwa."
 }
 
+# Vifurushi kwanza (curl inahitajika ili kupakua faili)
 install_dependencies
+
+# Kama faili zinazohitajika hazipo kwenye folder hii, zipakue kutoka GitHub
+need_download=0
+for f in "${REQUIRED_FILES[@]}"; do
+  [[ -f "${SRC_DIR}/${f}" ]] || need_download=1
+done
+
+if (( need_download == 1 )); then
+  info "Faili zinazohitajika hazipo kwenye folder hii. Inapakua kutoka GitHub..."
+  TMP_SRC="$(mktemp -d)"
+  trap 'rm -rf "$TMP_SRC"' EXIT
+  for f in "${REQUIRED_FILES[@]}"; do
+    if ! curl -fsSL --connect-timeout 10 --max-time 60 "${RAW_BASE}/${f}" -o "${TMP_SRC}/${f}"; then
+      err "Imeshindikana kupakua '${f}' kutoka ${RAW_BASE}"
+      err "Hakikisha server ina internet na faili lipo kwenye GitHub repo."
+      exit 1
+    fi
+  done
+  SRC_DIR="$TMP_SRC"
+  ok "Faili zote zimepakuliwa."
+fi
 
 ########################################
 # 4. KUSOMA MIPANGILIO YA ZAMANI (KAMA IPO)
