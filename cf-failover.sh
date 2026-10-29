@@ -1,42 +1,18 @@
 #!/bin/bash
 #
-# cf-failover.sh
-# Health-check ya node + DNS failover kwenye Cloudflare - PEKEE.
-#
-# Script hii sasa HAISOMI TENA amri za Telegram (/addip, vitufe, n.k.) -
-# kazi hiyo imehamishiwa kwenye 'cf-telegram-bot.sh', huduma tofauti
-# (systemd) inayoendesha kwenye server zile zile, ikisikiliza muda
-# wote na kujibu ndani ya sekunde 1-2 badala ya kusubiri run ya cron.
-#
-# Sababu ya mgawanyo: health-check + kubadili DNS lazima ibaki kila
-# dakika 1 (kuifanya ya papo hapo kungesababisha DNS kubadilika kila
-# node ikipepesuka kidogo [flap], na kuharibu utulivu wa mfumo) - lakini
-# kusoma amri za Telegram hakuna sababu ya kusubiri dakika nzima, hivyo
-# hiyo sasa ni huduma inayoendesha papo hapo, tofauti kabisa na hii.
-#
-# Weka script hii (pamoja na cf-failover-lib.sh) kwenye SERVER ZOTE
-# (node zote) - kila moja inafanya health-check + failover kwa
-# kujitegemea, ikisoma NODE_PRIORITY/TARGET_RECORDS ile ile kutoka
-# Cloudflare TXT record kila run.
+# cf-failover.sh (v2.0 Professional Edition)
+# Injini ya kukagua afya ya nodes na kuhamisha DNS kiotomatiki (Auto-Failover)
+# Ina Anti-Flapping (kuhakiki mara 2 kabla ya kuhamisha) na Parallel Health Checks.
 
 set -uo pipefail
-# NOTA: 'set -e' imeondolewa kimakusudi - amri za mtandao (curl kwenda
-# Cloudflare) zinaweza kushindwa mara kwa mara kwa sababu za muda tu.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="/etc/cf-failover/config.env"
 LIB_FILE="${SCRIPT_DIR}/cf-failover-lib.sh"
+STATE_FILE="/etc/cf-failover/state.env"
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "ERROR: Config file haipo. Kimbiza install.sh kwanza."
-  exit 1
-fi
-if [[ ! -f "$LIB_FILE" ]]; then
-  echo "ERROR: cf-failover-lib.sh haipo (inatarajiwa kwenye ${SCRIPT_DIR})."
-  exit 1
-fi
-if ! command -v jq >/dev/null 2>&1; then
-  echo "ERROR: 'jq' haipo kwenye mfumo huu. Sakinisha kwa: apt-get install -y jq"
+if [[ ! -f "$CONFIG_FILE" || ! -f "$LIB_FILE" ]]; then
+  echo "ERROR: Config au Library haipo." >&2
   exit 1
 fi
 
@@ -45,194 +21,158 @@ source "$CONFIG_FILE"
 # shellcheck disable=SC1090
 source "$LIB_FILE"
 
-# NOTA: NODE_PRIORITY na TARGET_RECORDS HAZIHITAJIKI tena kwenye
-# config.env - zinasomwa MOJA KWA MOJA kutoka Cloudflare (get_shared_config,
-# chini) kila run. VPS hii haihifadhi domain/IP yoyote yenyewe - unaziweka
-# tu kupitia amri za Telegram baada ya usakinishaji.
-for var in CF_API_TOKEN CF_ZONE_ID CONFIG_RECORD_NAME; do
-  if [[ -z "${!var:-}" ]]; then
-    echo "ERROR: ${var} haipo au haina thamani kwenye ${CONFIG_FILE}. Rekebisha kisha jaribu tena."
-    exit 1
-  fi
-done
-NODE_PRIORITY="${NODE_PRIORITY:-}"
-TARGET_RECORDS="${TARGET_RECORDS:-}"
-
-trap 'echo "$(date "+%Y-%m-%d %H:%M:%S") - ERROR: script imesimama bila kutarajiwa kwenye line $LINENO" >&2' ERR
+ensure_node_id
 
 ########################################
-# LOCK - kuzuia run mbili kwa wakati mmoja (kwenye server hii hii)
+# 1. LOCK FILE (ZUIA CRON KUGONGANA)
 ########################################
-LOCK_FILE="/var/lock/cf-failover.lock"
-exec 200>"$LOCK_FILE"
-if ! flock -n 200; then
-  echo "$(date '+%Y-%m-%d %H:%M:%S') - Run nyingine bado inaendelea, ninaruka run hii."
+LOCK_FILE="/var/lock/cf-failover-check.lock"
+mkdir -p "$(dirname "$LOCK_FILE")"
+exec 201>"$LOCK_FILE"
+if ! flock -n 201; then
+  log "cf-failover.sh tayari inaendesha. Ninatoka."
   exit 0
 fi
 
 ########################################
-# DEFAULTS
+# 2. STATE MANAGEMENT (ATOMIC)
 ########################################
-STATE_FILE="/etc/cf-failover/state.env"
-mkdir -p "$(dirname "$STATE_FILE")"
-CHECK_TIMEOUT="${CHECK_TIMEOUT:-5}"
-FAIL_THRESHOLD="${FAIL_THRESHOLD:-2}"
-CHECK_PORT="${CHECK_PORT:-443}"
-CHECK_METHOD="${CHECK_METHOD:-tcp}"
-HEALTH_PATH="${HEALTH_PATH:-/}"
-CHECK_SCHEME="${CHECK_SCHEME:-https}"
-CURL_TIMEOUT="${CURL_TIMEOUT:-10}"
-TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
-STATUS_REPORT_MINUTES="${STATUS_REPORT_MINUTES:-360}"
-DNS_TTL="${DNS_TTL:-60}"
+LAST_ACTIVE_IP=""
+LAST_NODES_STATE=""
 
-# State ya health-check TU (TELEGRAM_OFFSET/PENDING_ACTION sasa ziko
-# kwenye faili tofauti inayotumiwa na cf-telegram-bot.sh pekee).
-FAIL_COUNT=0
-ALL_DOWN_NOTIFIED=0
-LAST_REPORT_EPOCH=0
-PREV_NODE_STATUS=""
-
-load_state() {
-  if [[ -f "$STATE_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$STATE_FILE"
-  fi
+load_health_state() {
+  local key val
+  [[ -f "$STATE_FILE" ]] || return 0
+  while IFS='=' read -r key val || [[ -n "$key" ]]; do
+    [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+    val="${val%\"}"
+    val="${val#\"}"
+    case "$key" in
+      LAST_ACTIVE_IP)  LAST_ACTIVE_IP="$val" ;;
+      LAST_NODES_STATE) LAST_NODES_STATE="$val" ;;
+    esac
+  done < "$STATE_FILE"
 }
 
-save_state() {
-  cat > "$STATE_FILE" <<EOF
-FAIL_COUNT=$FAIL_COUNT
-ALL_DOWN_NOTIFIED=$ALL_DOWN_NOTIFIED
-LAST_REPORT_EPOCH=$LAST_REPORT_EPOCH
-PREV_NODE_STATUS="${NODE_STATUS_JOINED:-${PREV_NODE_STATUS:-}}"
+save_health_state() {
+  local tmp_file="${STATE_FILE}.tmp.$$"
+  mkdir -p "$(dirname "$STATE_FILE")"
+  cat > "$tmp_file" <<EOF
+LAST_ACTIVE_IP="${LAST_ACTIVE_IP:-}"
+LAST_NODES_STATE="${LAST_NODES_STATE:-}"
 EOF
+  chmod 600 "$tmp_file" 2>/dev/null || true
+  mv -f "$tmp_file" "$STATE_FILE"
 }
 
-trap 'save_state 2>/dev/null || true' EXIT
+########################################
+# 3. DNS RECORD UPDATER (PRESERVES PROXY)
+########################################
+ensure_domain_points_to() {
+  local domain="$1"
+  local target_ip="$2"
+  local resp rec_id cur_ip cur_proxied payload
+
+  resp=$(cf_api GET "/dns_records?type=A&name=${domain}") || return 1
+  jq -e '.success == true' <<< "$resp" >/dev/null 2>&1 || return 1
+
+  rec_id=$(jq -r '.result[0].id // empty' <<< "$resp")
+  cur_ip=$(jq -r '.result[0].content // empty' <<< "$resp")
+  cur_proxied=$(jq -r "if .result[0].proxied == null then ${DEFAULT_PROXIED:-false} else .result[0].proxied end" <<< "$resp")
+
+  # Kama tayari iko kwenye IP sahihi, usipige PUT API bila sababu
+  if [[ -n "$rec_id" && "$cur_ip" == "$target_ip" ]]; then
+    return 0
+  fi
+
+  payload=$(jq -nc \
+    --arg name "$domain" \
+    --arg content "$target_ip" \
+    --argjson ttl "${DNS_TTL:-60}" \
+    --argjson proxied "$cur_proxied" \
+    '{type:"A", name:$name, content:$content, ttl:$ttl, proxied:$proxied}')
+
+  if [[ -n "$rec_id" ]]; then
+    resp=$(cf_api PUT "/dns_records/${rec_id}" "$payload") || return 1
+  else
+    resp=$(cf_api POST "/dns_records" "$payload") || return 1
+  fi
+
+  if jq -e '.success == true' <<< "$resp" >/dev/null 2>&1; then
+    log "DNS IMESASISHWA: ${domain} -> ${target_ip} (proxied=${cur_proxied})"
+    return 2 # 2 inamaanisha mabadiliko yamefanyika
+  fi
+  return 1
+}
 
 ########################################
-# MAIN
+# 4. MAIN FAILOVER LOGIC & ANTI-FLAPPING
 ########################################
-load_state
-get_shared_config   # NODE_PRIORITY / TARGET_RECORDS kutoka Cloudflare (chanzo kimoja)
+load_health_state
+get_shared_config
 
-if [[ -z "$NODE_PRIORITY" || -z "$TARGET_RECORDS" ]]; then
-  log "Hakuna node/domain iliyowekwa bado (NODE_PRIORITY/TARGET_RECORDS tupu kwenye Cloudflare). Tumia Telegram (Ongeza Node / Ongeza Domain) kuanzisha."
+if [[ -z "${NODE_PRIORITY:-}" || -z "${TARGET_RECORDS:-}" ]]; then
+  log "NODE_PRIORITY au TARGET_RECORDS bado ni tupu. Ninasubiri ziongezwe kupitia Telegram."
   exit 0
 fi
 
-health_check_all    # inajaza PRIORITY_ARR, NODE_STATUS_ARR, DESIRED_IP
-TOP_IP="${PRIORITY_ARR[0]}"
-TOP_IP_UP="${NODE_STATUS_ARR[0]}"
-NODE_STATUS_JOINED=$(IFS=,; echo "${NODE_STATUS_ARR[*]}")
+check_all_nodes_parallel
 
-# Arifa za kila node ikibadilika hali (up<->down)
-if [[ -n "${PREV_NODE_STATUS:-}" ]]; then
-  IFS=',' read -ra PREV_STATUS_ARR <<< "$PREV_NODE_STATUS"
-  idx=0
-  for ip in "${PRIORITY_ARR[@]}"; do
-    old_status="${PREV_STATUS_ARR[$idx]:-1}"
-    new_status="${NODE_STATUS_ARR[$idx]}"
-    if [[ "$old_status" != "$new_status" ]]; then
-      TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
-      if [[ "$new_status" == "1" ]]; then
-        notify_telegram "🟢 *Node $((idx+1))* (\`${ip}\`) imerudi hewani
-🕒 ${TIMESTAMP}"
-      else
-        notify_telegram "🔴 *Node $((idx+1))* (\`${ip}\`) imeshuka
-🕒 ${TIMESTAMP}"
-      fi
-    fi
-    idx=$((idx+1))
-  done
-fi
+IFS=',' read -r -a IPS <<< "$NODE_PRIORITY"
+IFS=',' read -r -a DOMAINS <<< "$TARGET_RECORDS"
 
-save_state
-
-if [[ -z "$DESIRED_IP" ]]; then
-  TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
-  log "ONYO: Node ZOTE hazirespondi!"
-  if [[ "${ALL_DOWN_NOTIFIED:-0}" -eq 0 ]]; then
-    notify_telegram "🚨🚨 *DHARURA* 🚨🚨
-━━━━━━━━━━━━━━━
-Node ZOTE hazirespondi!
-📍 \`${NODE_PRIORITY}\`
-🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━
-❌ Hakuna DNS iliyobadilishwa
-👉 Tafadhali angalia servers zako haraka
-
-_Arifa hii itatumwa tena tu ikiwa hali haitabadilika._"
-    ALL_DOWN_NOTIFIED=1
-  fi
-  save_state
-  exit 0
-else
-  if [[ "${ALL_DOWN_NOTIFIED:-0}" -eq 1 ]]; then
-    notify_telegram "🟢 *NAFUU* — angalau node moja imerudi hewani (\`${DESIRED_IP}\`)"
-    ALL_DOWN_NOTIFIED=0
-    save_state
+# ANTI-FLAPPING: Kama IP iliyokuwa active mara ya mwisho imeonekana DOWN,
+# ipige check ya pili baada ya sekunde 2 ili kujiridhisha siyo hiccup ya mtandao.
+if [[ -n "$LAST_ACTIVE_IP" && "${NODE_HEALTH_MAP[$LAST_ACTIVE_IP]:-}" == "DOWN" ]]; then
+  sleep 2
+  if check_node_health "$LAST_ACTIVE_IP"; then
+    NODE_HEALTH_MAP["$LAST_ACTIVE_IP"]="UP"
+    log "Anti-Flapping: ${LAST_ACTIVE_IP} ilipona kwenye jaribio la pili."
   fi
 fi
 
-if [[ "$TOP_IP_UP" -eq 0 ]]; then
-  FAIL_COUNT=$((FAIL_COUNT + 1))
-  if [[ "$FAIL_COUNT" -eq 1 ]] || [[ "$FAIL_COUNT" -eq "$FAIL_THRESHOLD" ]]; then
-    log "TOP priority node ($TOP_IP) hairespondi. Fail count: $FAIL_COUNT/$FAIL_THRESHOLD"
-  fi
-else
-  FAIL_COUNT=0
-fi
-save_state
+BEST_IP=""
+CURRENT_NODES_STATE=""
 
-IFS=',' read -ra RECORDS_ARR <<< "$TARGET_RECORDS"
-for record in "${RECORDS_ARR[@]}"; do
-  info=$(get_record_info "$record")
-  record_id="${info%%|*}"
-  current_ip="${info##*|}"
-
-  if [[ "$current_ip" == "$DESIRED_IP" ]]; then
-    continue
-  fi
-  if [[ "$current_ip" == "$TOP_IP" ]] && [[ "$FAIL_COUNT" -lt "$FAIL_THRESHOLD" ]]; then
-    continue
-  fi
-
-  log "${record}: ${current_ip:-haipo} -> ${DESIRED_IP}"
-  if upsert_dns "$record" "$record_id" "$DESIRED_IP"; then
-    TIMESTAMP=$(date '+%H:%M:%S | %d-%m-%Y')
-    if [[ "$DESIRED_IP" == "$TOP_IP" ]]; then
-      notify_telegram "✅ *RESTORED* — Node kuu imerudi hewani!
-━━━━━━━━━━━━━━━
-🌐 Record: \`${record}\`
-🔙 Imerudi: \`${DESIRED_IP}\` (top priority)
-🕒 ${TIMESTAMP}
-━━━━━━━━━━━━━━━
-Kila kitu kinaendelea sawa 🎉"
-    else
-      notify_telegram "🔁 *FAILOVER* — DNS imebadilishwa
-━━━━━━━━━━━━━━━
-🌐 Record: \`${record}\`
-➡️ IP mpya: \`${DESIRED_IP}\`
-🕒 ${TIMESTAMP}"
-    fi
+for ip in "${IPS[@]}"; do
+  [[ -z "$ip" ]] && continue
+  st="${NODE_HEALTH_MAP[$ip]:-DOWN}"
+  CURRENT_NODES_STATE+="${ip}:${st},"
+  if [[ "$st" == "UP" && -z "$BEST_IP" ]]; then
+    BEST_IP="$ip"
   fi
 done
 
-########################################
-# STATUS REPORT ya ratiba (siyo /refresh - hiyo sasa inashughulikiwa
-# papo hapo na cf-telegram-bot.sh moja kwa moja)
-########################################
-NOW_EPOCH=$(date +%s)
-if [[ "$STATUS_REPORT_MINUTES" -gt 0 ]]; then
-  ELAPSED_MIN=$(( (NOW_EPOCH - LAST_REPORT_EPOCH) / 60 ))
-  if [[ "$ELAPSED_MIN" -ge "$STATUS_REPORT_MINUTES" ]]; then
-    notify_telegram "$(format_status_report)"
-    LAST_REPORT_EPOCH="$NOW_EPOCH"
+if [[ -z "$BEST_IP" ]]; then
+  log "ONYO KUU: Nodes ZOTE ziko DOWN!"
+  if [[ "$LAST_NODES_STATE" != "$CURRENT_NODES_STATE" ]]; then
+    LAST_NODES_STATE="$CURRENT_NODES_STATE"
+    save_health_state
+    notify_telegram "🚨 *TAHADHARI KUU (${NODE_ID}):*
+Nodes ZOTE kwenye orodha ya Priority zimeshindwa kujibu (OFFLINE)! DNS haijabadilishwa."
   fi
+  exit 1
 fi
 
-save_state
-exit 0
+CHANGED_DOMAINS=()
+for domain in "${DOMAINS[@]}"; do
+  [[ -z "$domain" ]] && continue
+  rc=0
+  ensure_domain_points_to "$domain" "$BEST_IP" || rc=$?
+  if (( rc == 2 )); then
+    CHANGED_DOMAINS+=("$domain")
+  fi
+done
+
+# Tuma taarifa Telegram TU kama kuna mabadiliko ya DNS au hali ya Node imebadilika
+if (( ${#CHANGED_DOMAINS[@]} > 0 )) || [[ -n "$LAST_ACTIVE_IP" && "$LAST_ACTIVE_IP" != "$BEST_IP" ]]; then
+  notify_telegram "⚡ *FAILOVER IMETEKELEZWA (kutoka ${NODE_ID})*
+
+🎯 *IP Mpya Inayotumika:* \`${BEST_IP}\`
+🔄 *IP ya Awali:* \`${LAST_ACTIVE_IP:-Hakuna}\`
+🌐 *Domains Zilizohamishwa:* \`${CHANGED_DOMAINS[*]:-${TARGET_RECORDS}}\`"
+fi
+
+LAST_ACTIVE_IP="$BEST_IP"
+LAST_NODES_STATE="$CURRENT_NODES_STATE"
+save_health_state
