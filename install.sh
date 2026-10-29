@@ -1,255 +1,483 @@
 #!/bin/bash
 #
-# install.sh - One-click installer kwa cf-failover
+# install.sh (v2.0 Professional Installer & Upgrader)
+# Kisakinishi cha Mfumo wa Cloudflare Failover + Telegram Bot (Long-Polling)
 #
 # Matumizi:
-#   curl -sSL https://raw.githubusercontent.com/Kabut27/cf-failover/main/install.sh | sudo bash
-#
-# USANIFU: Kazi mbili zimetenganishwa kwenye faili/huduma mbili, zote
-# mbili zinasakinishwa kwenye SERVER ZOTE (hakuna server "kuu"):
-#   1. Health-check + DNS-failover (cf-failover.sh) -> CRON, kila
-#      dakika 1. Hii ndiyo inayolinda utulivu wa mfumo - usiifanye ya
-#      papo hapo maana node ikipepesuka (flap) DNS itabadilika mno na
-#      kuharibu utulivu.
-#   2. Amri za Telegram (/addip, vitufe, n.k.) -> SYSTEMD SERVICE
-#      (cf-telegram-bot.sh) inayosikiliza muda wote - majibu yanakuja
-#      ndani ya sekunde 1-2 badala ya kusubiri run ya cron.
+#   sudo bash install.sh             # Usakinishaji mpya au kubadilisha mipangilio
+#   sudo bash install.sh --upgrade   # Kusasisha scripts pekee bila kuuliza maswali
+#   sudo bash install.sh --uninstall # Kuondoa huduma kwenye server hii
 
-set -euo pipefail
+set -uo pipefail
 
-REPO_RAW_URL="https://raw.githubusercontent.com/Kabut27/cf-failover/main"
+########################################
+# 1. RANGI NA MIPANGILIO YA MSINGI
+########################################
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/opt/cf-failover"
 CONFIG_DIR="/etc/cf-failover"
 CONFIG_FILE="${CONFIG_DIR}/config.env"
-SYSTEMD_UNIT="/etc/systemd/system/cf-failover-telegram.service"
+NODE_ID_FILE="${CONFIG_DIR}/node-id"
 
-echo "=============================================="
-echo " Cloudflare Failover - Installer"
-echo "=============================================="
-echo ""
+SYSTEMD_DIR="/etc/systemd/system"
+BOT_SERVICE="${SYSTEMD_DIR}/cf-telegram-bot.service"
+FAILOVER_SERVICE="${SYSTEMD_DIR}/cf-failover.service"
+FAILOVER_TIMER="${SYSTEMD_DIR}/cf-failover.timer"
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Tafadhali kimbiza script hii na sudo/root."
+info()  { printf "${CYAN}[INFO]${NC} %s\n" "$*"; }
+ok()    { printf "${GREEN}[SAWA]${NC} %s\n" "$*"; }
+warn()  { printf "${YELLOW}[ONYO]${NC} %s\n" "$*"; }
+err()   { printf "${RED}[KOSA]${NC} %s\n" "$*" >&2; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  err "Tafadhali endesha script hii kama root: sudo bash install.sh"
   exit 1
 fi
 
-# Hakikisha zana muhimu zipo - baadhi ya VPS minimal hazina cron/curl/jq kwa default
-for dep in curl flock; do
-  if ! command -v "$dep" >/dev/null 2>&1; then
-    echo "ERROR: '$dep' haipo kwenye mfumo huu. Sakinisha kwanza (mfano: apt-get install -y $dep)."
+MODE="${1:-install}"
+
+########################################
+# 2. KUONDOA MFUMO (--uninstall)
+########################################
+if [[ "$MODE" == "--uninstall" || "$MODE" == "uninstall" ]]; then
+  warn "Inaondoa huduma za Cloudflare Failover kwenye server hii..."
+  systemctl stop cf-telegram-bot.service cf-failover.timer cf-failover.service 2>/dev/null || true
+  systemctl disable cf-telegram-bot.service cf-failover.timer 2>/dev/null || true
+  rm -f "$BOT_SERVICE" "$FAILOVER_SERVICE" "$FAILOVER_TIMER"
+  systemctl daemon-reload 2>/dev/null || true
+
+  rm -f /usr/local/bin/cf-failover.sh /usr/local/bin/cf-telegram-bot.sh /usr/local/bin/cf-failover-lib.sh
+  rm -rf "$INSTALL_DIR"
+  rm -f /var/lock/cf-telegram-bot.lock /var/lock/cf-failover-check.lock
+
+  read -r -p "Je, unataka kufuta pia folder la mipangilio (/etc/cf-failover)? [y/N]: " del_cfg
+  if [[ "${del_cfg,,}" == "y" || "${del_cfg,,}" == "yes" ]]; then
+    rm -rf "$CONFIG_DIR"
+    ok "Mipangilio (/etc/cf-failover) imefutwa."
+  else
+    info "Mipangilio imeachwa salama kwenye ${CONFIG_DIR}."
+  fi
+  ok "Mfumo umeondolewa kikamilifu."
+  exit 0
+fi
+
+########################################
+# 3. KUKAGUA FAILI NA KUSAKINISHA VIFURUSHI
+########################################
+for req_file in cf-failover-lib.sh cf-failover.sh cf-telegram-bot.sh; do
+  if [[ ! -f "${SRC_DIR}/${req_file}" ]]; then
+    err "Faili '${req_file}' halikupatikana ndani ya ${SRC_DIR}!"
+    err "Hakikisha install.sh iko kwenye folder moja na cf-failover-lib.sh, cf-failover.sh, na cf-telegram-bot.sh."
     exit 1
   fi
 done
-if ! command -v crontab >/dev/null 2>&1; then
-  echo "cron haijasakinishwa - ninasakinisha sasa..."
-  apt-get update -qq && apt-get install -y -qq cron
-  systemctl enable --now cron >/dev/null 2>&1 || true
-fi
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq haijasakinishwa - ninasakinisha sasa (inahitajika kwa amri za Telegram)..."
-  apt-get update -qq && apt-get install -y -qq jq
-fi
-if ! command -v systemctl >/dev/null 2>&1; then
-  echo "ERROR: systemd (systemctl) haipo kwenye mfumo huu - inahitajika kwa huduma ya Telegram."
-  exit 1
-fi
 
-# Husomea input isiyo tupu - inarudia kuuliza mpaka mtumiaji ajaze
-require_input() {
-  local prompt="$1"
-  local __resultvar="$2"
-  local value=""
-  while [[ -z "$value" ]]; do
-    read -rp "$prompt" value
-    if [[ -z "$value" ]]; then
-      echo "  -> Sehemu hii haiwezi kuachwa wazi, jaribu tena."
-    fi
-  done
-  printf -v "$__resultvar" '%s' "$value"
+install_dependencies() {
+  local missing=()
+  command -v curl >/dev/null 2>&1 || missing+=("curl")
+  command -v jq >/dev/null 2>&1   || missing+=("jq")
+  command -v flock >/dev/null 2>&1 || missing+=("util-linux")
+
+  if (( ${#missing[@]} == 0 )); then
+    return 0
+  fi
+
+  info "Inasakinisha vifurushi vinavyohitajika: ${missing[*]}..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y -q "${missing[@]}" ca-certificates
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q "${missing[@]}" ca-certificates
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache "${missing[@]}" ca-certificates bash
+  else
+    err "Imeshindikana kutambua package manager. Tafadhali sakinisha: curl, jq, flock."
+    exit 1
+  fi
+  ok "Vifurushi vimesakinishwa."
 }
 
-# Muhimu: script inapokimbizwa kupitia "curl | bash", stdin ya kawaida
-# inakuwa imeshikwa na curl - hivyo tunailazimisha 'read' isome moja kwa
-# moja kutoka kwenye terminal yako (tty) ili maswali yaonekane na kufanya kazi.
-if [[ -t 0 ]]; then
-  : # stdin tayari ni terminal, hakuna cha kufanya
-elif [[ -e /dev/tty ]]; then
-  exec < /dev/tty
-else
-  echo "ERROR: Haiwezi kusoma input ya terminal. Pakua script kisha kimbiza moja kwa moja:"
-  echo "  curl -sSL ${REPO_RAW_URL}/install.sh -o install.sh && sudo bash install.sh"
-  exit 1
+install_dependencies
+
+########################################
+# 4. KUSOMA MIPANGILIO YA ZAMANI (KAMA IPO)
+########################################
+mkdir -p "$CONFIG_DIR" "$INSTALL_DIR"
+chmod 700 "$CONFIG_DIR"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE" || true
 fi
 
-require_input "Cloudflare API Token (Zone.DNS Edit): " CF_API_TOKEN
-require_input "Cloudflare Zone ID: " CF_ZONE_ID
-echo ""
-echo "cf-failover inahifadhi orodha ya node (IP) na domain kwenye TXT record"
-echo "MOJA kwenye Cloudflare - HAIHIFADHIWI kwenye VPS hii kabisa. Utaziongeza"
-echo "baadaye kupitia amri za Telegram (baada ya usakinishaji kukamilika)."
-echo "Weka jina la TXT record hii (chagua jina lolote lisilotumika, mfano"
-echo "_cf-failover-config.domain.com) - LAZIMA liwe SAWA kwenye server zote."
-require_input "Config record name: " CONFIG_RECORD_NAME
-echo ""
+CF_API_TOKEN="${CF_API_TOKEN:-}"
+CF_ZONE_ID="${CF_ZONE_ID:-}"
+CONFIG_RECORD_NAME="${CONFIG_RECORD_NAME:-}"
+NODE_PRIORITY="${NODE_PRIORITY:-}"
+TARGET_RECORDS="${TARGET_RECORDS:-}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+CHECK_METHOD="${CHECK_METHOD:-tcp}"
+CHECK_PORT="${CHECK_PORT:-443}"
+CHECK_SCHEME="${CHECK_SCHEME:-https}"
+HEALTH_PATH="${HEALTH_PATH:-/}"
+CHECK_TIMEOUT="${CHECK_TIMEOUT:-5}"
+CURL_TIMEOUT="${CURL_TIMEOUT:-10}"
+DNS_TTL="${DNS_TTL:-60}"
+DEFAULT_PROXIED="${DEFAULT_PROXIED:-false}"
+CF_TG_HEARTBEAT_INTERVAL="${CF_TG_HEARTBEAT_INTERVAL:-30}"
+CF_TG_LEADER_TTL="${CF_TG_LEADER_TTL:-90}"
 
-read -rp "Port ya kucheck [443]: " CHECK_PORT
-CHECK_PORT=${CHECK_PORT:-443}
-while ! [[ "$CHECK_PORT" =~ ^[0-9]+$ ]] || [[ "$CHECK_PORT" -lt 1 ]] || [[ "$CHECK_PORT" -gt 65535 ]]; do
-  echo "  -> Port lazima iwe namba kati ya 1-65535."
-  read -rp "Port ya kucheck [443]: " CHECK_PORT
-  CHECK_PORT=${CHECK_PORT:-443}
-done
+########################################
+# 5. KAZI ZA KUSAKINISHA FAILI NA SYSTEMD
+########################################
+deploy_files_and_services() {
+  info "Inanakili scripts kwenye ${INSTALL_DIR}..."
+  cp -f "${SRC_DIR}/cf-failover-lib.sh" "${INSTALL_DIR}/cf-failover-lib.sh"
+  cp -f "${SRC_DIR}/cf-failover.sh" "${INSTALL_DIR}/cf-failover.sh"
+  cp -f "${SRC_DIR}/cf-telegram-bot.sh" "${INSTALL_DIR}/cf-telegram-bot.sh"
 
-read -rp "Fail threshold (mara ngapi ishindwe kabla ya kubadili) [2]: " FAIL_THRESHOLD
-FAIL_THRESHOLD=${FAIL_THRESHOLD:-2}
-while ! [[ "$FAIL_THRESHOLD" =~ ^[0-9]+$ ]] || [[ "$FAIL_THRESHOLD" -lt 1 ]]; do
-  echo "  -> Weka namba kamili (mfano 2, 3)."
-  read -rp "Fail threshold (mara ngapi ishindwe kabla ya kubadili) [2]: " FAIL_THRESHOLD
-  FAIL_THRESHOLD=${FAIL_THRESHOLD:-2}
-done
+  chmod 750 "${INSTALL_DIR}/cf-failover-lib.sh" "${INSTALL_DIR}/cf-failover.sh" "${INSTALL_DIR}/cf-telegram-bot.sh"
 
-echo ""
-echo "Aina ya health check: 'tcp' (inaangalia tu port iko wazi) au 'http'"
-echo "(inaangalia jibu halisi la panel/service - sahihi zaidi)."
-read -rp "Check method [tcp]: " CHECK_METHOD
-CHECK_METHOD=${CHECK_METHOD:-tcp}
-CHECK_METHOD=$(echo "$CHECK_METHOD" | tr '[:upper:]' '[:lower:]')
-while [[ "$CHECK_METHOD" != "tcp" && "$CHECK_METHOD" != "http" ]]; do
-  echo "  -> Weka 'tcp' au 'http' pekee."
-  read -rp "Check method [tcp]: " CHECK_METHOD
-  CHECK_METHOD=${CHECK_METHOD:-tcp}
-  CHECK_METHOD=$(echo "$CHECK_METHOD" | tr '[:upper:]' '[:lower:]')
-done
+  # Weka symlinks kwenye /usr/local/bin ili ziweze kuitwa popote
+  ln -sf "${INSTALL_DIR}/cf-failover-lib.sh" /usr/local/bin/cf-failover-lib.sh
+  ln -sf "${INSTALL_DIR}/cf-failover.sh" /usr/local/bin/cf-failover.sh
+  ln -sf "${INSTALL_DIR}/cf-telegram-bot.sh" /usr/local/bin/cf-telegram-bot.sh
 
-HEALTH_PATH="/"
-CHECK_SCHEME="https"
-if [[ "$CHECK_METHOD" == "http" ]]; then
-  read -rp "Health check scheme (http/https) [https]: " CHECK_SCHEME
-  CHECK_SCHEME=${CHECK_SCHEME:-https}
-  read -rp "Health check path [/]: " HEALTH_PATH
-  HEALTH_PATH=${HEALTH_PATH:-/}
-fi
+  # Hakiki syntax ya Bash
+  bash -n "${INSTALL_DIR}/cf-failover-lib.sh"
+  bash -n "${INSTALL_DIR}/cf-failover.sh"
+  bash -n "${INSTALL_DIR}/cf-telegram-bot.sh"
+  ok "Scripts zimehakikiwa na kunakiliwa kikamilifu."
 
-echo ""
-echo "Arifa za Telegram ni hiari, LAKINI zinahitajika kama unataka kutumia"
-echo "amri za /addip, /removeip, /addrecord n.k. Acha wazi (Enter) kama hutaki."
-echo "MUHIMU: tumia bot iliyotengwa kwa cf-failover peke yake (siyo bot"
-echo "inayotumika na huduma nyingine), na tumia Bot Token/Chat ID SAWA"
-echo "kwenye server zote unazosakinisha."
-read -rp "Telegram Bot Token (hiari): " TELEGRAM_BOT_TOKEN
-read -rp "Telegram Chat ID (hiari): " TELEGRAM_CHAT_ID
-while [[ -n "$TELEGRAM_CHAT_ID" ]] && ! [[ "$TELEGRAM_CHAT_ID" =~ ^-?[0-9]+$ ]]; do
-  echo "  -> Chat ID lazima iwe namba (inaweza kuanza na - kwa group chat)."
-  read -rp "Telegram Chat ID (hiari): " TELEGRAM_CHAT_ID
-done
+  # Ondoa cron ya zamani (kama ilikuwepo kwenye v1) ili isigongane na systemd timer
+  if crontab -l 2>/dev/null | grep -q 'cf-failover\.sh'; then
+    info "Inaondoa cron job ya zamani ya cf-failover.sh (inahamia kwenye systemd timer)..."
+    crontab -l 2>/dev/null | grep -v 'cf-failover\.sh' | crontab - || true
+  fi
+  rm -f /etc/cron.d/cf-failover
 
-STATUS_REPORT_MINUTES=360
-if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
-  echo ""
-  echo "Ripoti ya hali ya node zote (siyo tu mabadiliko) inaweza kutumwa mara kwa mara."
-  read -rp "Tuma ripoti kila dakika ngapi? [360 = masaa 6, weka 0 kuzima]: " STATUS_REPORT_MINUTES
-  STATUS_REPORT_MINUTES=${STATUS_REPORT_MINUTES:-360}
-  while ! [[ "$STATUS_REPORT_MINUTES" =~ ^[0-9]+$ ]]; do
-    echo "  -> Weka namba kamili (mfano 360), au 0 kuzima."
-    read -rp "Tuma ripoti kila dakika ngapi? [360]: " STATUS_REPORT_MINUTES
-    STATUS_REPORT_MINUTES=${STATUS_REPORT_MINUTES:-360}
-  done
-fi
+  info "Inaunda Systemd Services na Timer..."
 
-echo ""
-echo "Inathibitisha uhalali wa Cloudflare Token/Zone ID..."
-CF_CHECK=$(curl -s --connect-timeout 5 --max-time 10 \
-  "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}" \
-  -H "Authorization: Bearer ${CF_API_TOKEN}" \
-  -H "Content-Type: application/json" 2>/dev/null || echo "")
-if echo "$CF_CHECK" | grep -q '"success":true'; then
-  echo "  -> Token na Zone ID vimethibitika. ✅"
-else
-  echo "  -> ONYO: Imeshindwa kuthibitisha Token/Zone ID (huenda si sahihi, au mtandao)."
-  echo "     Installation itaendelea, lakini script haitafanya kazi mpaka hii ikamilishwe."
-fi
+  cat > "$BOT_SERVICE" <<EOF
+[Unit]
+Description=Cloudflare Failover Telegram Bot Service (v2.0 Long-Polling)
+After=network-online.target
+Wants=network-online.target
 
-echo ""
-echo "Inaweka faili..."
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/cf-telegram-bot.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
 
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
-
-curl -sSL "${REPO_RAW_URL}/cf-failover-lib.sh" -o "${INSTALL_DIR}/cf-failover-lib.sh"
-curl -sSL "${REPO_RAW_URL}/cf-failover.sh" -o "${INSTALL_DIR}/cf-failover.sh"
-chmod +x "${INSTALL_DIR}/cf-failover-lib.sh" "${INSTALL_DIR}/cf-failover.sh"
-
-cat > "$CONFIG_FILE" <<EOF
-CF_API_TOKEN="${CF_API_TOKEN}"
-CF_ZONE_ID="${CF_ZONE_ID}"
-CONFIG_RECORD_NAME="${CONFIG_RECORD_NAME}"
-CHECK_PORT="${CHECK_PORT}"
-FAIL_THRESHOLD="${FAIL_THRESHOLD}"
-CHECK_METHOD="${CHECK_METHOD}"
-CHECK_SCHEME="${CHECK_SCHEME}"
-HEALTH_PATH="${HEALTH_PATH}"
-CURL_TIMEOUT="10"
-DNS_TTL="60"
-TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
-TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
-STATUS_REPORT_MINUTES="${STATUS_REPORT_MINUTES}"
+[Install]
+WantedBy=multi-user.target
 EOF
 
-chmod 600 "$CONFIG_FILE"
+  cat > "$FAILOVER_SERVICE" <<EOF
+[Unit]
+Description=Cloudflare Auto-Failover Health Check (v2.0)
+After=network-online.target
+Wants=network-online.target
 
-# Cron - health-check + DNS-failover TU, kila dakika, kwenye node HII
-# (weka kwenye node zote unazosakinisha).
-CRON_LINE="* * * * * ${INSTALL_DIR}/cf-failover.sh >> /var/log/cf-failover.log 2>&1"
-( crontab -l 2>/dev/null | grep -v "cf-failover.sh" ; echo "$CRON_LINE" ) | crontab -
-
-# Log rotation - inazuia log kujaza disk
-if [[ -d /etc/logrotate.d ]]; then
-  cat > /etc/logrotate.d/cf-failover <<'EOF'
-/var/log/cf-failover.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-    copytruncate
-}
+[Service]
+Type=oneshot
+ExecStart=${INSTALL_DIR}/cf-failover.sh
+NoNewPrivileges=true
+PrivateTmp=true
 EOF
-fi
 
-# Huduma ya Telegram (systemd) - kwenye server HII (weka kwenye node
-# zote unazosakinisha, sawa na cron - hakuna server "kuu"). Inasakinishwa
-# tu kama Bot Token/Chat ID zimewekwa.
-if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
-  echo ""
-  echo "Inaweka huduma ya Telegram (systemd) kwenye server hii..."
-  curl -sSL "${REPO_RAW_URL}/cf-telegram-bot.sh" -o "${INSTALL_DIR}/cf-telegram-bot.sh"
-  chmod +x "${INSTALL_DIR}/cf-telegram-bot.sh"
-  curl -sSL "${REPO_RAW_URL}/cf-failover-telegram.service" -o "$SYSTEMD_UNIT"
+  cat > "$FAILOVER_TIMER" <<EOF
+[Unit]
+Description=Run Cloudflare Auto-Failover Health Check every 60 seconds
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload
-  systemctl enable --now cf-failover-telegram.service
-  echo "  -> Huduma ya Telegram imewashwa. Amri zitajibiwa ndani ya sekunde 1-2."
-  echo "  -> Angalia kwa: journalctl -u cf-failover-telegram -f"
+  systemctl enable cf-telegram-bot.service cf-failover.timer >/dev/null 2>&1
+  systemctl restart cf-telegram-bot.service
+  systemctl restart cf-failover.timer
+  systemctl start cf-failover.service || true
+
+  ok "Huduma za Systemd (cf-telegram-bot.service & cf-failover.timer) zimewashwa!"
+}
+
+# Kama mtumiaji amechagua --upgrade na config.env tayari ipo, sasisha moja kwa moja!
+if [[ "$MODE" == "--upgrade" || "$MODE" == "upgrade" ]]; then
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    err "Hakuna ${CONFIG_FILE} iliyopatikana kwa ajili ya upgrade. Kimbiza 'sudo bash install.sh' bila --upgrade."
+    exit 1
+  fi
+  info "Inafanya Upgrade ya haraka kwenda v2.0..."
+  deploy_files_and_services
+  ok "Upgrade ya v2.0 imekamilika kikamilifu!"
+  exit 0
+fi
+
+########################################
+# 6. MAHOJIANO NA UTHIBITISHAJI (INTERACTIVE SETUP)
+########################################
+printf "\n${BOLD}============================================================${NC}\n"
+printf "${BOLD}   CLOUDFLARE FAILOVER & TELEGRAM BOT v2.0 - USAKINISHAJI   ${NC}\n"
+printf "${BOLD}============================================================${NC}\n\n"
+
+prompt_input() {
+  local prompt_text="$1"
+  local default_val="$2"
+  local is_secret="${3:-0}"
+  local input_val=""
+
+  if [[ -n "$default_val" ]]; then
+    if (( is_secret == 1 )); then
+      local masked="${default_val:0:4}****${default_val: -4}"
+      read -r -p "${prompt_text} [${masked}]: " input_val
+    else
+      read -r -p "${prompt_text} [${default_val}]: " input_val
+    fi
+    printf '%s' "${input_val:-$default_val}"
+  else
+    while [[ -z "$input_val" ]]; do
+      read -r -p "${prompt_text}: " input_val
+    done
+    printf '%s' "$input_val"
+  fi
+}
+
+# --- HATUA YA 1: CLOUDFLARE API & ZONE ---
+while true; do
+  CF_API_TOKEN="$(prompt_input "1. Ingiza Cloudflare API Token (yenye ruhusa ya DNS Edit)" "$CF_API_TOKEN" 1)"
+
+  info "Inahakiki Cloudflare API Token na kutafuta Zones..."
+  zones_resp=$(curl -sS --connect-timeout 5 --max-time 10 \
+    -H "Content-Type: application/json" \
+    --config - <<EOF 2>/dev/null || true
+url = "https://api.cloudflare.com/client/v4/zones?per_page=50"
+header = "Authorization: Bearer ${CF_API_TOKEN}"
+EOF
+  )
+
+  if jq -e '.success == true' <<< "$zones_resp" >/dev/null 2>&1; then
+    zone_count=$(jq -r '.result | length' <<< "$zones_resp")
+    if (( zone_count == 1 )) && [[ -z "$CF_ZONE_ID" ]]; then
+      CF_ZONE_ID=$(jq -r '.result[0].id' <<< "$zones_resp")
+      zone_name=$(jq -r '.result[0].name' <<< "$zones_resp")
+      ok "Imegundua Zone moja kiotomatiki: ${zone_name} (${CF_ZONE_ID})"
+    elif (( zone_count > 1 )); then
+      printf "\n${CYAN}Zones zilizopatikana kwenye akaunti yako:${NC}\n"
+      jq -r '.result[] | "  • \(.name)  ->  Zone ID: \(.id)"' <<< "$zones_resp"
+      printf "\n"
+    fi
+  fi
+
+  CF_ZONE_ID="$(prompt_input "2. Ingiza Cloudflare Zone ID" "$CF_ZONE_ID" 0)"
+
+  # Hakiki Zone ID
+  zone_check=$(curl -sS --connect-timeout 5 --max-time 10 \
+    -H "Content-Type: application/json" \
+    --config - <<EOF 2>/dev/null || true
+url = "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}"
+header = "Authorization: Bearer ${CF_API_TOKEN}"
+EOF
+  )
+
+  if jq -e '.success == true' <<< "$zone_check" >/dev/null 2>&1; then
+    ZONE_DOMAIN=$(jq -r '.result.name // "domain.com"' <<< "$zone_check")
+    ok "Cloudflare imeunganishwa kikamilifu! (Domain Kuu: ${ZONE_DOMAIN})"
+    break
+  else
+    err "Imeshindikana kuunganisha na Zone ID '${CF_ZONE_ID}'. Hakikisha Token ina ruhusa ya Zone:DNS:Edit."
+    CF_API_TOKEN=""
+    CF_ZONE_ID=""
+  fi
+done
+
+# --- HATUA YA 2: CONFIG TXT RECORD & AUTO-DISCOVERY ---
+default_cfg_rec="${CONFIG_RECORD_NAME:-_cf-failover.${ZONE_DOMAIN}}"
+CONFIG_RECORD_NAME="$(prompt_input "3. Jina la TXT Record ya kuhifadhi mipangilio ya pamoja" "$default_cfg_rec" 0)"
+
+info "Inakagua kama kuna mipangilio iliyopo kwenye TXT record (${CONFIG_RECORD_NAME})..."
+txt_resp=$(curl -sS --connect-timeout 5 --max-time 10 \
+  -H "Content-Type: application/json" \
+  --config - <<EOF 2>/dev/null || true
+url = "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=TXT&name=${CONFIG_RECORD_NAME}"
+header = "Authorization: Bearer ${CF_API_TOKEN}"
+EOF
+)
+
+existing_txt=$(jq -r '.result[0].content // empty' <<< "$txt_resp" 2>/dev/null || true)
+existing_txt="${existing_txt#\"}"
+existing_txt="${existing_txt%\"}"
+
+if [[ -n "$existing_txt" ]]; then
+  ok "Mipangilio ya Cluster imepatikana kwenye Cloudflare: ${existing_txt}"
+  IFS=';' read -r -a kv_parts <<< "$existing_txt"
+  for part in "${kv_parts[@]}"; do
+    k="${part%%=*}"
+    v="${part#*=}"
+    case "$k" in
+      PRIORITY|NODE_PRIORITY) [[ -n "$v" ]] && NODE_PRIORITY="$v" ;;
+      RECORDS|TARGET_RECORDS) [[ -n "$v" ]] && TARGET_RECORDS="$v" ;;
+    esac
+  done
+  info "Imepakia kiotomatiki -> Nodes: [${NODE_PRIORITY:-Tupu}] | Domains: [${TARGET_RECORDS:-Tupu}]"
 else
-  if systemctl list-unit-files 2>/dev/null | grep -q "cf-failover-telegram.service"; then
-    systemctl disable --now cf-failover-telegram.service >/dev/null 2>&1 || true
+  info "Hakuna TXT record ya zamani iliyopatikana. Hii inaonekana ni server ya kwanza kwenye Cluster."
+fi
+
+# Tambua IP ya server hii
+MY_PUBLIC_IP=$(curl -4 -sS --connect-timeout 4 --max-time 5 https://api.ipify.org 2>/dev/null || \
+               curl -4 -sS --connect-timeout 4 --max-time 5 https://ifconfig.me 2>/dev/null || true)
+
+if [[ -n "$MY_PUBLIC_IP" ]]; then
+  info "Public IP ya server hii imegunduliwa: ${MY_PUBLIC_IP}"
+  if [[ ",${NODE_PRIORITY}," != *",${MY_PUBLIC_IP},"* ]]; then
+    read -r -p "   Je, ungependa kuongeza IP ya server hii (${MY_PUBLIC_IP}) kwenye NODE_PRIORITY? [Y/n]: " add_my_ip
+    if [[ -z "$add_my_ip" || "${add_my_ip,,}" == "y" || "${add_my_ip,,}" == "yes" ]]; then
+      if [[ -n "$NODE_PRIORITY" ]]; then
+        NODE_PRIORITY="${NODE_PRIORITY},${MY_PUBLIC_IP}"
+      else
+        NODE_PRIORITY="${MY_PUBLIC_IP}"
+      fi
+    fi
   fi
 fi
 
-echo ""
-echo "=============================================="
-echo " Imekamilika!"
-echo "=============================================="
-echo "Config: $CONFIG_FILE"
-echo "Scripts: ${INSTALL_DIR}/"
-echo "Logs (health-check/cron): /var/log/cf-failover.log"
-if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
-  echo "Logs (Telegram bot):      journalctl -u cf-failover-telegram -f"
+read -r -p "4. Orodha ya IP za Nodes kwa mpangilio ( unaweza kuacha tupu na kuongeza kwa Bot ) [${NODE_PRIORITY:-Tupu}]: " in_prio
+[[ -n "$in_prio" ]] && NODE_PRIORITY="${in_prio// /}"
+
+read -r -p "5. Domains zinazolindwa (mfano: cdn1.${ZONE_DOMAIN},cdn2.${ZONE_DOMAIN}) [${TARGET_RECORDS:-Tupu}]: " in_recs
+[[ -n "$in_recs" ]] && TARGET_RECORDS="${in_recs// /}"
+
+# --- HATUA YA 3: MIPANGILIO YA HEALTH CHECK ---
+CHECK_METHOD="$(prompt_input "6. Njia ya kukagua afya ya Nodes (tcp / https / http)" "$CHECK_METHOD" 0)"
+CHECK_METHOD="${CHECK_METHOD,,}"
+CHECK_PORT="$(prompt_input "7. Port ya kukagua (mfano: 443 au 80)" "$CHECK_PORT" 0)"
+
+if [[ "$CHECK_METHOD" == "http" || "$CHECK_METHOD" == "https" ]]; then
+  CHECK_SCHEME="$CHECK_METHOD"
+  HEALTH_PATH="$(prompt_input "8. Health Check URL Path (mfano: / au /health)" "$HEALTH_PATH" 0)"
 fi
-echo ""
-echo "MUHIMU: Kimbiza installer hii kwenye node zako ZOTE ukitumia CF_API_TOKEN,"
-echo "CF_ZONE_ID, CONFIG_RECORD_NAME, TELEGRAM_BOT_TOKEN na TELEGRAM_CHAT_ID"
-echo "SAWA kila mahali."
-echo ""
-echo "HATUA INAYOFUATA: Server hii bado HAINA node wala domain yoyote"
-echo "iliyowekwa (hazihifadhiwi kwenye VPS kabisa). Fungua Telegram kwenye bot"
-echo "yako na tumia vitufe '➕ Ongeza Node' na '🌐 Ongeza Domain' kuanzisha -"
-echo "mara utakapoongeza, server ZOTE ulizosakinisha zitafuata kiotomatiki."
+
+# --- HATUA YA 4: TELEGRAM BOT TOKEN & CHAT ID ---
+while true; do
+  TELEGRAM_BOT_TOKEN="$(prompt_input "9. Ingiza Telegram Bot Token (kutoka @BotFather)" "$TELEGRAM_BOT_TOKEN" 1)"
+  TELEGRAM_CHAT_ID="$(prompt_input "10. Ingiza Telegram Chat ID yako" "$TELEGRAM_CHAT_ID" 0)"
+
+  info "Inatuma ujumbe wa majaribio kwenye Telegram..."
+  test_kb='{"keyboard":[[{"text":"🔄 Refresh"},{"text":"📋 Orodha Nodes"},{"text":"📄 Orodha Domains"}],[{"text":"➕ Ongeza Node"},{"text":"➖ Ondoa Node"},{"text":"🎯 Weka Priority"}],[{"text":"🌐 Ongeza Domain"},{"text":"🗑️ Ondoa Domain"},{"text":"🧹 Safisha Marudio"}],[{"text":"ℹ️ Msaada"},{"text":"❌ Ghairi"}]],"resize_keyboard":true,"is_persistent":true}'
+
+  tg_payload=$(jq -nc \
+    --arg chat_id "$TELEGRAM_CHAT_ID" \
+    --arg text "✅ *Cloudflare Failover v2.0 Imesakinishwa!*
+🖥️ *Server IP:* \`${MY_PUBLIC_IP:-Unknown}\`
+🌐 *Zone:* \`${ZONE_DOMAIN}\`
+
+Tumia vitufe vya hapa chini kusimamia Nodes na Domains zako muda wowote." \
+    --argjson reply_markup "$test_kb" \
+    '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", reply_markup: $reply_markup}')
+
+  tg_resp=$(curl -sS --connect-timeout 5 --max-time 10 \
+    -H "Content-Type: application/json" \
+    --data "$tg_payload" \
+    --config - <<EOF 2>/dev/null || true
+url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+EOF
+  )
+
+  if jq -e '.ok == true' <<< "$tg_resp" >/dev/null 2>&1; then
+    ok "Ujumbe wa majaribio umetumwa kwenye Telegram yako kikamilifu!"
+    break
+  else
+    tg_err=$(jq -r '.description // "Imeshindikana kuwasiliana na Telegram"' <<< "$tg_resp" 2>/dev/null || echo "Unknown Error")
+    err "Kosa la Telegram: ${tg_err}"
+    warn "Hakikisha umeanzisha mazungumzo na Bot wako (/start) na Chat ID ni sahihi."
+    TELEGRAM_BOT_TOKEN=""
+    TELEGRAM_CHAT_ID=""
+  fi
+done
+
+########################################
+# 7. KUHIFADHI CONFIG.ENV KWA USALAMA
+########################################
+info "Inahifadhi mipangilio kwenye ${CONFIG_FILE}..."
+tmp_cfg="${CONFIG_FILE}.tmp.$$"
+
+cat > "$tmp_cfg" <<EOF
+# Cloudflare Failover v2.0 Configuration
+# Faili hili lina siri muhimu (chmod 600)
+
+CF_API_TOKEN="${CF_API_TOKEN}"
+CF_ZONE_ID="${CF_ZONE_ID}"
+CONFIG_RECORD_NAME="${CONFIG_RECORD_NAME}"
+
+NODE_PRIORITY="${NODE_PRIORITY}"
+TARGET_RECORDS="${TARGET_RECORDS}"
+
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
+
+CHECK_METHOD="${CHECK_METHOD}"
+CHECK_PORT="${CHECK_PORT}"
+CHECK_SCHEME="${CHECK_SCHEME}"
+HEALTH_PATH="${HEALTH_PATH}"
+CHECK_TIMEOUT="${CHECK_TIMEOUT}"
+CURL_TIMEOUT="${CURL_TIMEOUT}"
+DNS_TTL="${DNS_TTL}"
+DEFAULT_PROXIED="${DEFAULT_PROXIED}"
+
+CF_TG_HEARTBEAT_INTERVAL="${CF_TG_HEARTBEAT_INTERVAL}"
+CF_TG_LEADER_TTL="${CF_TG_LEADER_TTL}"
+EOF
+
+chmod 600 "$tmp_cfg"
+mv -f "$tmp_cfg" "$CONFIG_FILE"
+ok "Faili la ${CONFIG_FILE} limehifadhiwa kwa ulinzi wa chmod 600."
+
+########################################
+# 8. KUWASHA HUDUMA NA KUSASISHA CLOUDFLARE TXT
+########################################
+deploy_files_and_services
+
+# Hifadhi NODE_PRIORITY na TARGET_RECORDS kwenye Cloudflare TXT kama zimewekwa
+if [[ -n "$NODE_PRIORITY" || -n "$TARGET_RECORDS" ]]; then
+  info "Inasasisha mipangilio ya pamoja kwenye Cloudflare TXT (${CONFIG_RECORD_NAME})..."
+  (
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    # shellcheck disable=SC1090
+    source "${INSTALL_DIR}/cf-failover-lib.sh"
+    save_shared_config && ok "Cloudflare TXT imesasishwa!" || warn "Imeshindikana kusasisha Cloudflare TXT kwa sasa."
+  )
+fi
+
+printf "\n${GREEN}${BOLD}============================================================${NC}\n"
+printf "${GREEN}${BOLD}   🎉 USAKINISHAJI WA v2.0 UMEKAMILIKA KIKAMILIFU!          ${NC}\n"
+printf "${GREEN}${BOLD}============================================================${NC}\n"
+printf " • Kuangalia logi za Bot moja kwa moja:\n"
+printf "   ${CYAN}sudo journalctl -u cf-telegram-bot -f${NC}\n\n"
+printf " • Kuangalia logi za Health Check / Failover:\n"
+printf "   ${CYAN}sudo journalctl -u cf-failover -f${NC}\n\n"
+printf " • Kusasisha scripts pekee siku za usoni:\n"
+printf "   ${CYAN}sudo bash install.sh --upgrade${NC}\n\n"
